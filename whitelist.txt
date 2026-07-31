@@ -1,0 +1,45 @@
+# auth-proxy whitelist (overrides built-in DEFAULT_WHITELIST).
+# One host pattern per line; fnmatch globs allowed (e.g. *.example.com).
+# Reload after editing:  kill -HUP <pid>
+
+# ---- built-in defaults (reproduced so nothing is lost) ----
+anthropic.com
+*.anthropic.com
+claude.ai
+*.claude.ai
+claude.com
+*.claude.com
+openai.com
+*.openai.com
+chatgpt.com
+*.chatgpt.com
+oaistatic.com
+*.oaistatic.com
+oaiusercontent.com
+*.oaiusercontent.com
+github.com
+*.github.com
+githubusercontent.com
+*.githubusercontent.com
+githubassets.com
+*.githubassets.com
+codeload.github.com
+npmjs.org
+*.npmjs.org
+npmjs.com
+*.npmjs.com
+google.com
+*.google.com
+googleapis.com
+*.googleapis.com
+gstatic.com
+*.gstatic.com
+googleusercontent.com
+*.googleusercontent.com
+gvt1.com
+*.gvt1.com
+
+# ---- GitHub Copilot ----
+githubcopilot.com
+*.githubcopilot.com
+default.exp-tas.com

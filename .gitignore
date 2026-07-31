@@ -1,0 +1,24 @@
+# Runtime logs, metrics, alerts, and generated reports
+*.log
+stats.jsonl
+alerts.jsonl
+reports/
+
+# Local credentials and environment
+.env
+.env.*
+*.secret
+.proxy-secret
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+*~
+*.swp

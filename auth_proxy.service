@@ -1,0 +1,41 @@
+[Unit]
+Description=SOCKS5 authenticated whitelist proxy (Ascend686)
+Documentation=file:///data/pypto/auth-proxy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root so PAM can verify credentials for any user in proxyusers.
+# The proxy only listens on 127.0.0.1 and does NOT open any privileged ports.
+User=root
+Group=root
+
+ExecStart=/usr/bin/python3 /data/pypto/auth-proxy/auth_proxy.py
+
+# Ensure logs / stats end up owned by pypto so pypto can read them without sudo.
+Environment=AUTHPROXY_DIR=/data/pypto/auth-proxy
+# The child code writes files with default umask; that gives root:root 644.
+# We fix this by (a) running with an override umask and (b) making the target
+# dir setgid so files inherit the pypto group.
+UMask=0027
+
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+
+# --- security tightening (still allows /etc/shadow access) ---
+NoNewPrivileges=false          # PAM's unix_chkpwd may need to spawn helpers
+ProtectSystem=strict
+ReadWritePaths=/data/pypto/auth-proxy /var/run/faillock /var/log
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=false         # PAM helpers are suid
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

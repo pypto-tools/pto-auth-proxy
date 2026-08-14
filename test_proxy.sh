@@ -6,7 +6,7 @@
 # affecting anyone still using the old :4780 tunnel.
 #
 # Usage:
-#   bash test_proxy.sh
+#   pto-authproxy test
 set -u
 
 PROXY_HOST=${PTO_AUTH_PROXY_LISTEN_HOST:-127.0.0.1}

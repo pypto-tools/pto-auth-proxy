@@ -11,6 +11,7 @@ STATE_DIR=$TOOL_DIR/state
 LOG_DIR=$TOOL_DIR/logs
 TMP_DIR=$TOOL_DIR/tmp
 BIN_LINK=/usr/local/bin/pto-auth-proxy
+BIN_ALIAS=/usr/local/bin/pto-authproxy
 INIT_CONFIG=0
 INSTALL_SERVICE=0
 ENABLE_SERVICE=0
@@ -88,6 +89,7 @@ install -m 0755 "$PROJECT_DIR/join-proxy.sh" \
 install -m 0755 "$PROJECT_DIR/test_proxy.sh" \
     "$PREFIX/auth-proxy/test_proxy.sh"
 ln -sfn "$PREFIX/bin/pto-auth-proxy" "$BIN_LINK"
+ln -sfn "$PREFIX/bin/pto-auth-proxy" "$BIN_ALIAS"
 
 if ((INIT_CONFIG)); then
     [[ -e "$CONFIG_DIR/auth-proxy.env" ]] ||
@@ -121,3 +123,4 @@ echo "配置: $CONFIG_DIR"
 echo "状态: $STATE_DIR"
 echo "日志: $LOG_DIR"
 echo "命令: $BIN_LINK"
+echo "兼容命令: $BIN_ALIAS"

@@ -193,7 +193,7 @@ echo "       source ~/.bashrc"
 echo "       pkill -u $ME claude 2>/dev/null; claude   # example for Claude Code"
 echo
 echo "  4. (Optional) Verify end-to-end:"
-echo "       bash $SRC_DIR/test_proxy.sh"
+echo "       pto-authproxy test"
 echo
 echo "  Advanced: for tools that only speak SOCKS5 (rare), you can also set"
 echo "       export ALL_PROXY=\"socks5h://${ME}:\\\$(cat ~/.proxy-secret-uri)@127.0.0.1:20808\""

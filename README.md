@@ -3,7 +3,8 @@
 面向共享 Linux 服务器的认证出口代理。它在本机提供 SOCKS5 和 HTTP CONNECT
 入口，使用每位用户自己的 PAM `authd` 鉴权，并通过域名白名单限制外部访问。
 
-公开命令为 `pto-auth-proxy`，正式安装遵循 `pypto-tools` 布局：
+公开命令为 `pto-auth-proxy`，同时提供更短的兼容命令 `pto-authproxy`。
+正式安装遵循 `pypto-tools` 布局：
 
 ```text
 /home/pypto-tools/pto-auth-proxy/
@@ -132,13 +133,22 @@ pto-auth-proxy report today
 管理员将用户加入配置的代理组后，用户可显式运行：
 
 ```bash
-pto-auth-proxy join
+pto-authproxy join
 ```
 
 该操作会安装并重启当前用户自己的 `authd`，因此不是只读命令。密码只允许用户在
 本机交互式终端中输入，不应发送给 AI、写入聊天、命令参数、仓库或共享日志。
 代理 URL 使用的凭据文件应保存 URL 编码后的值并设为 `0600`，避免特殊字符破坏
 HTTP/SOCKS URL。
+
+接入完成后可直接运行交互式端到端检查：
+
+```bash
+pto-authproxy test
+```
+
+`pto-authproxy` 和 `pto-auth-proxy` 完全等价；保留后者作为规范命令，已有脚本无需
+修改。
 
 ## 开发
 

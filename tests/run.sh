@@ -29,9 +29,6 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROJECT_DIR" \
 # Packaging and service safety invariants.
 grep -Fq 'TOOLS_ROOT=/home/pypto-tools' "$PROJECT_DIR/scripts/install.sh"
 grep -Fq 'BIN_LINK=/usr/local/bin/pto-auth-proxy' "$PROJECT_DIR/scripts/install.sh"
-grep -Fq 'BIN_ALIAS=/usr/local/bin/pto-authproxy' "$PROJECT_DIR/scripts/install.sh"
-grep -Fq 'ln -sfn "$PREFIX/bin/pto-auth-proxy" "$BIN_ALIAS"' \
-    "$PROJECT_DIR/scripts/install.sh"
 grep -Fq 'User=@PROXY_USER@' "$PROJECT_DIR/systemd/pto-auth-proxy.service.in"
 if grep -Fq 'User=root' "$PROJECT_DIR/systemd/pto-auth-proxy.service.in"; then
     echo "代理服务不应以 root 运行" >&2

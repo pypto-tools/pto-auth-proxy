@@ -1,14 +1,15 @@
-# auth-proxy whitelist (overrides built-in DEFAULT_WHITELIST).
-# One host pattern per line; fnmatch globs allowed (e.g. *.example.com).
-# Reload after editing:  kill -HUP <pid>
+# pto-auth-proxy whitelist. One fnmatch host pattern per line.
+# Installed upgrades never overwrite the administrator-managed copy.
 
-# ---- built-in defaults (reproduced so nothing is lost) ----
+# Anthropic / Claude
 anthropic.com
 *.anthropic.com
 claude.ai
 *.claude.ai
 claude.com
 *.claude.com
+
+# OpenAI / Codex / ChatGPT
 openai.com
 *.openai.com
 chatgpt.com
@@ -17,6 +18,8 @@ oaistatic.com
 *.oaistatic.com
 oaiusercontent.com
 *.oaiusercontent.com
+
+# GitHub repository HTML, API, raw, codeload, release and LFS assets
 github.com
 *.github.com
 githubusercontent.com
@@ -24,6 +27,8 @@ githubusercontent.com
 githubassets.com
 *.githubassets.com
 codeload.github.com
+
+# Existing optional developer services retained for compatibility
 npmjs.org
 *.npmjs.org
 npmjs.com
@@ -39,7 +44,7 @@ googleusercontent.com
 gvt1.com
 *.gvt1.com
 
-# ---- GitHub Copilot ----
+# GitHub Copilot
 githubcopilot.com
 *.githubcopilot.com
 default.exp-tas.com

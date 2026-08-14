@@ -1,0 +1,26 @@
+[Unit]
+Description=Authenticated whitelist proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@PROXY_USER@
+Group=@PROXY_GROUP@
+ExecStart=@PREFIX@/bin/pto-auth-proxy run
+Restart=on-failure
+RestartSec=3
+UMask=0027
+
+# PAM runs in each user's authd; the shared proxy itself needs no root access.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=@PREFIX@ @TOOL_DIR@/config
+ReadWritePaths=@TOOL_DIR@/state @TOOL_DIR@/logs /tmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

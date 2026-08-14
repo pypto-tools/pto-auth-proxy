@@ -3,12 +3,14 @@
 stats.jsonl
 alerts.jsonl
 reports/
+runtime/
 
 # Local credentials and environment
 .env
 .env.*
 *.secret
 .proxy-secret
+.proxy-secret-uri
 
 # Python caches and virtual environments
 __pycache__/

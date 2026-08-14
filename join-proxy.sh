@@ -15,7 +15,7 @@
 #   - `proxyusers` group exists and this user is a member
 #   - python3-pam is installed system-wide OR in this user's site-packages
 #
-# Usage:  bash /data/pypto/auth-proxy/join-proxy.sh
+# Usage:  pto-auth-proxy join
 
 set -u
 ME=$(id -un)
@@ -26,9 +26,13 @@ fail()   { printf '\033[31m✗\033[0m %s\n' "$*"; }
 info()   { printf '\033[36m•\033[0m %s\n' "$*"; }
 header() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
-SRC_DIR=/data/pypto/auth-proxy
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SRC_DIR=${PTO_AUTH_PROXY_SOURCE_DIR:-$SCRIPT_DIR}
 BIN_DIR=$HOME/.local/bin
 LOG_FILE=$HOME/.local/authproxy-authd.log
+PROXY_OWNER=${PTO_AUTH_PROXY_OWNER:-pypto}
+PROXY_GROUP=${PTO_AUTH_PROXY_GROUP:-proxyusers}
+PAM_SERVICE=${PTO_AUTH_PROXY_PAM_SERVICE:-sshd}
 
 # The daemon writes its socket to /tmp/authproxy-<user>.sock. We deliberately
 # do NOT use XDG_RUNTIME_DIR (/run/user/<uid>/) because that dir is 0700 so
@@ -38,10 +42,10 @@ LOG_FILE=$HOME/.local/authproxy-authd.log
 SOCK="/tmp/authproxy-${ME}.sock"
 
 header "Step 1: group membership"
-if id -nG "$ME" | tr ' ' '\n' | grep -qx proxyusers; then
-  pass "$ME is in proxyusers"
+if id -nG "$ME" | tr ' ' '\n' | grep -qx "$PROXY_GROUP"; then
+  pass "$ME is in $PROXY_GROUP"
 else
-  fail "$ME is NOT in proxyusers. Ask admin: sudo usermod -aG proxyusers $ME  (then log out and back in)"
+  fail "$ME is NOT in $PROXY_GROUP. Ask admin: sudo usermod -aG $PROXY_GROUP $ME  (then log out and back in)"
   exit 1
 fi
 
@@ -68,8 +72,13 @@ cp "$SRC_DIR/authd.py" "$BIN_DIR/authproxy-authd.py"
 chmod 700 "$BIN_DIR/authproxy-authd.py"
 
 # A tiny watchdog wrapper: keeps authd alive with 3s backoff if it crashes.
-cat > "$BIN_DIR/authproxy-watchdog.sh" << 'WD'
-#!/usr/bin/env bash
+# Persist only non-sensitive daemon configuration; passwords never enter it.
+{
+printf '#!/usr/bin/env bash\n'
+printf 'export PTO_AUTH_PROXY_OWNER=%q\n' "$PROXY_OWNER"
+printf 'export PTO_AUTH_PROXY_GROUP=%q\n' "$PROXY_GROUP"
+printf 'export PTO_AUTH_PROXY_PAM_SERVICE=%q\n' "$PAM_SERVICE"
+cat << 'WD'
 # authproxy-watchdog.sh -- keep authd alive
 LOG="${HOME}/.local/authproxy-authd.log"
 BIN="${HOME}/.local/bin/authproxy-authd.py"
@@ -81,6 +90,7 @@ while true; do
   sleep 3
 done
 WD
+} > "$BIN_DIR/authproxy-watchdog.sh"
 chmod 700 "$BIN_DIR/authproxy-watchdog.sh"
 pass "$BIN_DIR/authproxy-authd.py + watchdog installed"
 
@@ -158,13 +168,21 @@ echo "  port tunnels arbitrary TLS traffic, so almost every modern CLI"
 echo "  (curl, wget, npm, pip, git, node, ...) works with just these two."
 echo
 echo "  1. Store your password (chmod 600):"
-echo "       umask 077 && echo 'YOUR_LINUX_PASSWORD' > ~/.proxy-secret"
+cat <<'SECRET'
+       umask 077
+       read -r -s -p 'Linux password: ' PROXY_PASSWORD; echo
+       printf '%s' "$PROXY_PASSWORD" | python3 -c \
+         'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=""), end="")' \
+         > ~/.proxy-secret-uri
+       unset PROXY_PASSWORD
+       chmod 600 ~/.proxy-secret-uri
+SECRET
 echo
 echo "  2. Append to ~/.bashrc:"
 echo
 cat <<BASHRC
        # ---- 686 authenticated proxy ----
-       export HTTPS_PROXY="http://${ME}:\$(cat ~/.proxy-secret)@127.0.0.1:20809"
+       export HTTPS_PROXY="http://${ME}:\$(cat ~/.proxy-secret-uri)@127.0.0.1:20809"
        export HTTP_PROXY="\$HTTPS_PROXY"
        export NO_PROXY='localhost,127.0.0.0/8,::1,169.254.169.254,192.168.0.0/16,10.0.0.0/8'
        # ---------------------------------
@@ -178,6 +196,6 @@ echo "  4. (Optional) Verify end-to-end:"
 echo "       bash $SRC_DIR/test_proxy.sh"
 echo
 echo "  Advanced: for tools that only speak SOCKS5 (rare), you can also set"
-echo "       export ALL_PROXY=\"socks5h://${ME}:\\\$(cat ~/.proxy-secret)@127.0.0.1:20808\""
+echo "       export ALL_PROXY=\"socks5h://${ME}:\\\$(cat ~/.proxy-secret-uri)@127.0.0.1:20808\""
 echo "  but this is optional and usually not needed."
 echo

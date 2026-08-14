@@ -34,7 +34,7 @@ import time
 
 import pam as _pam_mod
 
-PAM_SERVICE = "sshd"
+PAM_SERVICE = os.environ.get("PTO_AUTH_PROXY_PAM_SERVICE", "sshd")
 
 # --- performance knobs ----------------------------------------------------
 # Serial PAM was the bottleneck: pam_unix forks unix_chkpwd (~100ms each),
@@ -50,14 +50,14 @@ PAM_TIMEOUT       = 8              # seconds; refuse if PAM hangs
 # Who is allowed to CONNECT to this authd (by UID). We accept:
 #   - the proxy owner (pypto) -- production path
 #   - ourselves               -- for self-tests via join-proxy.sh
-_PROXY_OWNER = "pypto"
+_PROXY_OWNER = os.environ.get("PTO_AUTH_PROXY_OWNER", "pypto")
 try:
     _ALLOWED_UIDS = {pwd.getpwnam(_PROXY_OWNER).pw_uid}
 except KeyError:
     _ALLOWED_UIDS = set()
 
 # Group that owns the socket file. Only members can even open() it.
-_SOCK_GROUP = "proxyusers"
+_SOCK_GROUP = os.environ.get("PTO_AUTH_PROXY_GROUP", "proxyusers")
 # NOTE: no module-level pam instance -- see comment in handle() for why.
 
 _UID = os.getuid()

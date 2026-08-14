@@ -34,13 +34,29 @@ from typing import Optional
 # /run/user/<uid>/authproxy-authd.sock and asks THAT daemon to run PAM.
 
 # ---- config knobs --------------------------------------------------------
+def _env_port(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer, got {raw!r}") from exc
+    if not 1 <= value <= 65535:
+        raise SystemExit(f"{name} must be between 1 and 65535, got {value}")
+    return value
+
+
 BASE_DIR       = Path(os.environ.get("AUTHPROXY_DIR",
                                      Path.home() / "auth-proxy")).resolve()
-WHITELIST_FILE = BASE_DIR / "whitelist.txt"      # optional; overrides default
-STATS_FILE     = BASE_DIR / "stats.jsonl"
-LOG_FILE       = BASE_DIR / "auth_proxy.log"
-ALERTS_FILE    = BASE_DIR / "alerts.jsonl"
-REPORTS_DIR    = BASE_DIR / "reports"
+WHITELIST_FILE = Path(os.environ.get(
+    "PTO_AUTH_PROXY_WHITELIST", BASE_DIR / "whitelist.txt")).resolve()
+STATS_FILE     = Path(os.environ.get(
+    "PTO_AUTH_PROXY_STATS_FILE", BASE_DIR / "stats.jsonl")).resolve()
+LOG_FILE       = Path(os.environ.get(
+    "PTO_AUTH_PROXY_LOG_FILE", BASE_DIR / "auth_proxy.log")).resolve()
+ALERTS_FILE    = Path(os.environ.get(
+    "PTO_AUTH_PROXY_ALERTS_FILE", BASE_DIR / "alerts.jsonl")).resolve()
+REPORTS_DIR    = Path(os.environ.get(
+    "PTO_AUTH_PROXY_REPORTS_DIR", BASE_DIR / "reports")).resolve()
 
 # ---- anomaly-detection thresholds (see anomaly_scan()) -------------------
 WINDOW_SECONDS         = 300     # rolling window we look at
@@ -54,13 +70,13 @@ REPORT_HOUR   = 0                # 00:05 local time
 REPORT_MINUTE = 5
 # --------------------------------------------------------------------------
 
-LISTEN_HOST    = "127.0.0.1"
-LISTEN_PORT    = 20808             # SOCKS5 listener
-HTTP_LISTEN_PORT = 20809           # HTTP CONNECT listener (for Node.js/undici)
-UPSTREAM_HOST  = "127.0.0.1"
-UPSTREAM_PORT  = 4780              # SSH RemoteForward landing on 686
-PROXY_GROUP    = "proxyusers"      # Linux group required for access
-PAM_SERVICE    = "sshd"           # /etc/pam.d/<service>
+LISTEN_HOST    = os.environ.get("PTO_AUTH_PROXY_LISTEN_HOST", "127.0.0.1")
+LISTEN_PORT    = _env_port("PTO_AUTH_PROXY_SOCKS_PORT", 20808)
+HTTP_LISTEN_PORT = _env_port("PTO_AUTH_PROXY_HTTP_PORT", 20809)
+UPSTREAM_HOST  = os.environ.get("PTO_AUTH_PROXY_UPSTREAM_HOST", "127.0.0.1")
+UPSTREAM_PORT  = _env_port("PTO_AUTH_PROXY_UPSTREAM_PORT", 4780)
+PROXY_GROUP    = os.environ.get("PTO_AUTH_PROXY_GROUP", "proxyusers")
+PAM_SERVICE    = os.environ.get("PTO_AUTH_PROXY_PAM_SERVICE", "sshd")
 
 DEFAULT_WHITELIST = [
     # Anthropic / Claude
@@ -700,7 +716,7 @@ def _iter_recent_stats(since_ts: int):
         buf = b""
         pos = size
         entries = []
-        while pos > 0 and (not entries or entries[0]["ts"] >= since_ts):
+        while pos > 0 and (not entries or entries[0].get("ts", 0) >= since_ts):
             read_from = max(0, pos - chunk)
             f.seek(read_from)
             data = f.read(pos - read_from)
@@ -722,9 +738,82 @@ def _iter_recent_stats(since_ts: int):
             entries = new_entries + entries
             if entries and entries[0].get("ts", 0) < since_ts:
                 break
+        # At offset zero, ``buf`` is a complete first line rather than a
+        # partial line from the preceding chunk.
+        if pos == 0 and buf.strip():
+            try:
+                entries.insert(0, json.loads(buf))
+            except Exception:
+                pass
     for e in entries:
         if e.get("ts", 0) >= since_ts:
             yield e
+
+
+def recent_download_ranking(window_seconds: int = 30 * 60,
+                            now: Optional[int] = None) -> list[dict]:
+    """Return per-user download totals for the trailing time window."""
+    if window_seconds <= 0:
+        raise ValueError("window_seconds must be positive")
+    end_ts = int(time.time()) if now is None else int(now)
+    since_ts = end_ts - window_seconds
+    per_user = _collections.defaultdict(lambda: {
+        "bytes_down": 0, "connections": 0,
+    })
+
+    for entry in _iter_recent_stats(since_ts):
+        if entry.get("ts", 0) > end_ts:
+            continue
+        user = entry.get("user")
+        if not user or user == "-":
+            continue
+        try:
+            bytes_down = max(0, int(entry.get("bytes_down", 0)))
+        except (TypeError, ValueError):
+            continue
+        item = per_user[user]
+        item["bytes_down"] += bytes_down
+        item["connections"] += 1
+
+    return [
+        {"rank": rank, "user": user, **values}
+        for rank, (user, values) in enumerate(
+            sorted(per_user.items(),
+                   key=lambda item: (-item[1]["bytes_down"], item[0])),
+            start=1)
+    ]
+
+
+def _format_bytes(value: int) -> str:
+    amount = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024 or unit == "TiB":
+            return f"{int(amount)} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{amount:.1f} TiB"
+
+
+def print_download_ranking(minutes: int = 30, as_json: bool = False) -> None:
+    """Print the recent per-user download ranking to stdout."""
+    generated_at = int(time.time())
+    ranking = recent_download_ranking(minutes * 60, now=generated_at)
+    if as_json:
+        print(json.dumps({
+            "generated_at": generated_at,
+            "window_minutes": minutes,
+            "users": ranking,
+        }, ensure_ascii=False, separators=(",", ":")))
+        return
+
+    print(f"最近 {minutes} 分钟用户下行流量排行")
+    print(f"{'排名':>4}  {'用户':<20} {'下行流量':>12} {'连接数':>8}")
+    if not ranking:
+        print("（暂无已完成连接的流量记录）")
+        return
+    for item in ranking:
+        print(f"{item['rank']:>4}  {item['user']:<20} "
+              f"{_format_bytes(item['bytes_down']):>12} "
+              f"{item['connections']:>8}")
 
 
 async def anomaly_scan_loop() -> None:
@@ -1035,6 +1124,25 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # `--traffic [MINUTES] [--json]` is an offline stats query and does not
+    # touch the running proxy.
+    if len(sys.argv) >= 2 and sys.argv[1] == "--traffic":
+        args = sys.argv[2:]
+        as_json = "--json" in args
+        values = [arg for arg in args if arg != "--json"]
+        try:
+            if len(values) > 1:
+                raise ValueError
+            minutes = int(values[0]) if values else 30
+            if minutes <= 0:
+                raise ValueError
+        except ValueError:
+            print("usage: auth_proxy.py --traffic [MINUTES] [--json]",
+                  file=sys.stderr)
+            sys.exit(2)
+        print_download_ranking(minutes, as_json=as_json)
+        sys.exit(0)
+
     # `--report YYYY-MM-DD` (or `--report today`) generates one report and
     # exits, without touching the running proxy. Useful for spot-checks.
     if len(sys.argv) >= 2 and sys.argv[1] == "--report":

@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_DIR=$(cd -- "$SELF_DIR/.." && pwd)
+
+if [[ "${PROJECT_DIR##*/}" == app ]]; then
+    TOOL_DIR=$(cd -- "$PROJECT_DIR/.." && pwd)
+    COMPONENT_DIR=$PROJECT_DIR/auth-proxy
+    DEFAULT_CONFIG=$TOOL_DIR/config/auth-proxy.env
+    DEFAULT_WHITELIST=$TOOL_DIR/config/whitelist.txt
+    DATA_DIR=$TOOL_DIR/state
+    LOG_DIR=$TOOL_DIR/logs
+else
+    TOOL_DIR=$PROJECT_DIR
+    COMPONENT_DIR=$PROJECT_DIR
+    DEFAULT_CONFIG=$PROJECT_DIR/config/auth-proxy.env.example
+    DEFAULT_WHITELIST=$PROJECT_DIR/config/whitelist.txt
+    DATA_DIR=$PROJECT_DIR/runtime/state
+    LOG_DIR=$PROJECT_DIR/runtime/logs
+fi
+
+CONFIG=${PTO_AUTH_PROXY_CONFIG:-$DEFAULT_CONFIG}
+if [[ "${1:-}" == --config ]]; then
+    (($# >= 2)) || { echo "--config 缺少路径" >&2; exit 2; }
+    CONFIG=$2
+    shift 2
+fi
+
+usage() {
+    cat <<'EOF'
+用法: pto-auth-proxy [--config FILE] COMMAND [ARGS]
+
+命令:
+  validate                  只读校验配置
+  run                       前台运行代理（供 systemd 使用）
+  traffic [MINUTES] [--json] 查看近期流量排行
+  report DATE               生成 today/yesterday/YYYY-MM-DD 报告
+  join                      交互式安装并启动当前用户 authd
+  test                      交互式端到端测试（含 GitHub 内容读取）
+EOF
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+load_config() {
+    [[ -r "$CONFIG" ]] || {
+        echo "无法读取 Auth Proxy 配置: $CONFIG" >&2
+        return 1
+    }
+    set -a
+    # 配置文件由管理员控制，只允许非敏感变量赋值。
+    # shellcheck source=/dev/null
+    source "$CONFIG"
+    set +a
+
+    : "${PTO_AUTH_PROXY_OWNER:=pypto}"
+    : "${PTO_AUTH_PROXY_GROUP:=proxyusers}"
+    : "${PTO_AUTH_PROXY_PAM_SERVICE:=sshd}"
+    : "${PTO_AUTH_PROXY_LISTEN_HOST:=127.0.0.1}"
+    : "${PTO_AUTH_PROXY_SOCKS_PORT:=20808}"
+    : "${PTO_AUTH_PROXY_HTTP_PORT:=20809}"
+    : "${PTO_AUTH_PROXY_UPSTREAM_HOST:=127.0.0.1}"
+    : "${PTO_AUTH_PROXY_UPSTREAM_PORT:=4780}"
+
+    export AUTHPROXY_DIR=${AUTHPROXY_DIR:-$DATA_DIR}
+    export PTO_AUTH_PROXY_WHITELIST=${PTO_AUTH_PROXY_WHITELIST:-$DEFAULT_WHITELIST}
+    export PTO_AUTH_PROXY_STATS_FILE=${PTO_AUTH_PROXY_STATS_FILE:-$DATA_DIR/stats.jsonl}
+    export PTO_AUTH_PROXY_ALERTS_FILE=${PTO_AUTH_PROXY_ALERTS_FILE:-$DATA_DIR/alerts.jsonl}
+    export PTO_AUTH_PROXY_REPORTS_DIR=${PTO_AUTH_PROXY_REPORTS_DIR:-$DATA_DIR/reports}
+    export PTO_AUTH_PROXY_LOG_FILE=${PTO_AUTH_PROXY_LOG_FILE:-$LOG_DIR/auth_proxy.log}
+}
+
+validate() {
+    load_config
+    [[ "$PTO_AUTH_PROXY_LISTEN_HOST" == 127.0.0.1 ||
+       "$PTO_AUTH_PROXY_LISTEN_HOST" == ::1 ]] || {
+        echo "拒绝非本机监听地址: $PTO_AUTH_PROXY_LISTEN_HOST" >&2
+        return 1
+    }
+    valid_port "$PTO_AUTH_PROXY_SOCKS_PORT" || {
+        echo "SOCKS5 端口无效: $PTO_AUTH_PROXY_SOCKS_PORT" >&2; return 1;
+    }
+    valid_port "$PTO_AUTH_PROXY_HTTP_PORT" || {
+        echo "HTTP CONNECT 端口无效: $PTO_AUTH_PROXY_HTTP_PORT" >&2; return 1;
+    }
+    valid_port "$PTO_AUTH_PROXY_UPSTREAM_PORT" || {
+        echo "上游端口无效: $PTO_AUTH_PROXY_UPSTREAM_PORT" >&2; return 1;
+    }
+    [[ "$PTO_AUTH_PROXY_SOCKS_PORT" != "$PTO_AUTH_PROXY_HTTP_PORT" ]] || {
+        echo "SOCKS5 和 HTTP CONNECT 不能使用同一端口" >&2; return 1;
+    }
+    [[ -r "$COMPONENT_DIR/auth_proxy.py" ]] || {
+        echo "缺少代理程序: $COMPONENT_DIR/auth_proxy.py" >&2; return 1;
+    }
+    [[ -r "$PTO_AUTH_PROXY_WHITELIST" ]] || {
+        echo "无法读取白名单: $PTO_AUTH_PROXY_WHITELIST" >&2; return 1;
+    }
+    echo "Auth Proxy 配置有效"
+}
+
+COMMAND=${1:-}
+[[ -n "$COMMAND" ]] || { usage; exit 2; }
+shift
+
+case "$COMMAND" in
+    validate)
+        (($# == 0)) || { usage; exit 2; }
+        validate
+        ;;
+    run)
+        (($# == 0)) || { usage; exit 2; }
+        validate >/dev/null
+        install -d -m 0750 "$DATA_DIR" "$DATA_DIR/reports" "$LOG_DIR"
+        exec python3 "$COMPONENT_DIR/auth_proxy.py"
+        ;;
+    traffic)
+        load_config
+        exec python3 "$COMPONENT_DIR/auth_proxy.py" --traffic "$@"
+        ;;
+    report)
+        (($# == 1)) || { usage; exit 2; }
+        load_config
+        exec python3 "$COMPONENT_DIR/auth_proxy.py" --report "$1"
+        ;;
+    join)
+        (($# == 0)) || { usage; exit 2; }
+        load_config
+        export PTO_AUTH_PROXY_SOURCE_DIR=$COMPONENT_DIR
+        exec bash "$COMPONENT_DIR/join-proxy.sh"
+        ;;
+    test)
+        (($# == 0)) || { usage; exit 2; }
+        load_config
+        exec bash "$COMPONENT_DIR/test_proxy.sh"
+        ;;
+    -h|--help|help) usage ;;
+    *) usage; echo "未知 Auth Proxy 命令: $COMMAND" >&2; exit 2 ;;
+esac

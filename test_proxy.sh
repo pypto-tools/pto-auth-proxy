@@ -9,9 +9,9 @@
 #   bash test_proxy.sh
 set -u
 
-PROXY_HOST=127.0.0.1
-PROXY_PORT=20808
-GROUP=proxyusers
+PROXY_HOST=${PTO_AUTH_PROXY_LISTEN_HOST:-127.0.0.1}
+PROXY_PORT=${PTO_AUTH_PROXY_SOCKS_PORT:-20808}
+GROUP=${PTO_AUTH_PROXY_GROUP:-proxyusers}
 USER_NAME=$(id -un)
 
 pass()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
@@ -62,26 +62,21 @@ if [ -z "$USER_PASS" ]; then
   exit 1
 fi
 
-# curl encodes ':' and '@' in userinfo; keep it simple and warn if unusual chars.
-if printf '%s' "$USER_PASS" | grep -q '[:@/?# ]'; then
-  info "  Your password has characters (: @ / ? # space) that need URL-encoding."
-  info "  If auth fails below, that may be why."
-fi
-
 # Helper: run curl through proxy, echo BOTH the HTTP code and stderr on one line
 _probe() {
     # $1=user  $2=pass  $3=url  $4=maxtime
     local out
     out=$(curl --max-time "${4:-8}" -sS \
-        --socks5-hostname "${1}:${2}@${PROXY_HOST}:${PROXY_PORT}" \
+        --socks5-hostname "${PROXY_HOST}:${PROXY_PORT}" \
+        --proxy-user "${1}:${2}" \
         "$3" -o /dev/null \
         -w 'HTTP=%{http_code}' 2>&1 || true)
     printf '%s' "$out"
 }
 
 # 3b. Correct password → must succeed (test this FIRST so we don't trip faillock)
-info "Testing YOUR password against a whitelisted domain (www.google.com)…"
-RESULT_OK=$(_probe "$USER_NAME" "$USER_PASS" "https://www.google.com/" 10)
+info "Testing YOUR password against a whitelisted domain (github.com)…"
+RESULT_OK=$(_probe "$USER_NAME" "$USER_PASS" "https://github.com/" 10)
 CODE_OK=$(printf '%s' "$RESULT_OK" | grep -oE 'HTTP=[0-9]+' | tail -1 | cut -d= -f2)
 if [ -n "$CODE_OK" ] && [ "$CODE_OK" -gt 0 ] 2>/dev/null && [ "$CODE_OK" != "000" ]; then
   pass "authenticated request went through (HTTP $CODE_OK)"
@@ -99,53 +94,71 @@ info "(deny=3 unlock_time=60). If you want to verify auth actually rejects,"
 info "wait until AFTER Steps 4/5 and run:  bash $0 --check-reject"
 
 # ---- 4. Whitelist checks -------------------------------------------------
-header "Step 4: whitelist positive tests"
-for dest in "api.github.com" "www.google.com" "api.openai.com"; do
+header "Step 4: service whitelist positive tests"
+SERVICE_OK=1
+for dest in "api.github.com" "api.anthropic.com" "api.openai.com"; do
   CODE=$(curl --max-time 10 -sS \
-      --socks5-hostname "${USER_NAME}:${USER_PASS}@${PROXY_HOST}:${PROXY_PORT}" \
+      --socks5-hostname "${PROXY_HOST}:${PROXY_PORT}" \
+      --proxy-user "${USER_NAME}:${USER_PASS}" \
       "https://${dest}/" -o /dev/null \
       -w '%{http_code}' 2>&1 || true)
   if [ "$CODE" -gt 0 ] 2>/dev/null && [ "$CODE" -ne 407 ]; then
     pass "$dest reachable (HTTP $CODE)"
   else
     fail "$dest FAILED (result: $CODE)"
+    SERVICE_OK=0
   fi
 done
+if [ "$SERVICE_OK" -ne 1 ]; then
+  exit 1
+fi
 
-# ---- 5. Whitelist negative test -----------------------------------------
-header "Step 5: non-whitelisted domain must be blocked"
+header "Step 5: GitHub content retrieval"
+_github_content() {
+  local label=$1 url=$2 pattern=$3 body
+  body=$(curl --max-time 20 -fsSL \
+      --socks5-hostname "${PROXY_HOST}:${PROXY_PORT}" \
+      --proxy-user "${USER_NAME}:${USER_PASS}" \
+      "$url" 2>&1) || {
+    fail "$label FAILED: $body"
+    return 1
+  }
+  if printf '%s' "$body" | grep -Fq "$pattern"; then
+    pass "$label returned expected content"
+  else
+    fail "$label returned data but expected marker was missing"
+    return 1
+  fi
+}
+
+GITHUB_CONTENT_OK=1
+_github_content "GitHub repository page" \
+  "https://github.com/openai/codex" "openai/codex" || GITHUB_CONTENT_OK=0
+_github_content "GitHub repository API" \
+  "https://api.github.com/repos/openai/codex" '"full_name": "openai/codex"' || GITHUB_CONTENT_OK=0
+_github_content "GitHub raw file" \
+  "https://raw.githubusercontent.com/openai/codex/main/README.md" "Codex CLI" || GITHUB_CONTENT_OK=0
+if [ "$GITHUB_CONTENT_OK" -ne 1 ]; then
+  fail "one or more GitHub content checks failed"
+  exit 1
+fi
+
+# ---- 6. Whitelist negative test -----------------------------------------
+header "Step 6: non-whitelisted domain must be blocked"
 OUT=$(curl --max-time 5 -sS \
-    --socks5-hostname "${USER_NAME}:${USER_PASS}@${PROXY_HOST}:${PROXY_PORT}" \
+    --socks5-hostname "${PROXY_HOST}:${PROXY_PORT}" \
+    --proxy-user "${USER_NAME}:${USER_PASS}" \
     https://www.baidu.com/ -o /dev/null \
     -w '%{http_code}' 2>&1 || true)
 if printf '%s' "$OUT" | grep -qiE 'SOCKS5|not allowed|000'; then
   pass "www.baidu.com correctly denied (expected — not on whitelist)"
 else
   fail "www.baidu.com was NOT denied — whitelist not enforced: $OUT"
+  exit 1
 fi
 
-# ---- 6. Print shell config snippet --------------------------------------
-header "Step 6: add this to your shell (one-time)"
-cat <<EOF
-
-Append the block below to ~/.bashrc (or ~/.zshrc), then \`source\` it:
-
-  # ---- Ascend686 shared proxy ----
-  export ALL_PROXY='socks5h://${USER_NAME}:<PASSWORD>@${PROXY_HOST}:${PROXY_PORT}'
-  export HTTP_PROXY="\$ALL_PROXY"
-  export HTTPS_PROXY="\$ALL_PROXY"
-  export NO_PROXY='localhost,127.0.0.0/8,::1,169.254.169.254,192.168.0.0/16,10.0.0.0/8,*.local'
-  # -------------------------------
-
-WARNING: putting the password in a plain env-var makes it visible in \`ps auxe\`
-for other users on this host. A safer pattern is to load it from a private file:
-
-  # ~/.proxy-secret  (chmod 600, contains ONE line: your password)
-  export ALL_PROXY="socks5h://${USER_NAME}:\$(cat ~/.proxy-secret)@${PROXY_HOST}:${PROXY_PORT}"
-
-Test it after sourcing:
-
-  curl -sSI https://api.anthropic.com/ | head -3
-
-All tests done.
-EOF
+# ---- 7. Completion -------------------------------------------------------
+header "Step 7: complete"
+pass "all proxy and GitHub content checks passed"
+info "Shell configuration is managed separately by 'pto-auth-proxy join'."
+info "Do not print expanded proxy environment variables; they contain credentials."

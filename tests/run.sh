@@ -34,11 +34,15 @@ if grep -Fq 'User=root' "$PROJECT_DIR/systemd/pto-auth-proxy.service.in"; then
     echo "代理服务不应以 root 运行" >&2
     exit 1
 fi
-if grep -Eq 'systemctl +(enable|start|restart)|enable --now' \
+if grep -Eq 'systemctl +(start|restart)|enable --now' \
     "$PROJECT_DIR/scripts/install.sh"; then
-    echo "安装脚本不应自动启停服务" >&2
+    echo "安装脚本不应自动启动或重启服务" >&2
     exit 1
 fi
+grep -Fq -- '--enable-service' "$PROJECT_DIR/scripts/install.sh"
+grep -Fq 'if ((ENABLE_SERVICE)); then' "$PROJECT_DIR/scripts/install.sh"
+grep -Fq 'systemctl enable pto-auth-proxy.service' \
+    "$PROJECT_DIR/scripts/install.sh"
 if grep -Fq 'PrivateTmp=true' "$PROJECT_DIR/systemd/pto-auth-proxy.service.in"; then
     echo "PrivateTmp 会隔离用户 authd socket" >&2
     exit 1

@@ -13,6 +13,7 @@ TMP_DIR=$TOOL_DIR/tmp
 BIN_LINK=/usr/local/bin/pto-auth-proxy
 INIT_CONFIG=0
 INSTALL_SERVICE=0
+ENABLE_SERVICE=0
 PROXY_USER=pypto
 PROXY_GROUP=proxyusers
 
@@ -31,16 +32,22 @@ while (($#)); do
         --prefix) PREFIX=$2; shift 2 ;;
         --init-config) INIT_CONFIG=1; shift ;;
         --install-service) INSTALL_SERVICE=1; shift ;;
+        --enable-service)
+            INSTALL_SERVICE=1
+            ENABLE_SERVICE=1
+            shift
+            ;;
         --proxy-user) PROXY_USER=$2; shift 2 ;;
         --proxy-group) PROXY_GROUP=$2; shift 2 ;;
         -h|--help)
             cat <<'EOF'
 用法: scripts/install.sh [OPTIONS]
 
-只安装程序；默认不创建配置、不安装 service、不启动服务。
+只安装程序；默认不创建配置、不安装 service、不启用或启动服务。
 
   --init-config          首次创建配置和白名单（已有文件不覆盖）
   --install-service      安装 systemd unit，但不 enable/start/restart
+  --enable-service       安装 systemd unit 并设置开机自启动，但不立即启动
   --proxy-user USER      服务用户，默认 pypto
   --proxy-group GROUP    服务用户组，默认 proxyusers
   --tools-root DIR       默认 /home/pypto-tools
@@ -101,7 +108,12 @@ if ((INSTALL_SERVICE)); then
         "$PROJECT_DIR/systemd/pto-auth-proxy.service.in" >"$service_tmp"
     install -m 0644 "$service_tmp" /etc/systemd/system/pto-auth-proxy.service
     systemctl daemon-reload
-    echo "已安装 pto-auth-proxy.service；未启用、未启动"
+    if ((ENABLE_SERVICE)); then
+        systemctl enable pto-auth-proxy.service
+        echo "已安装并启用 pto-auth-proxy.service；将在开机时启动，当前未启动"
+    else
+        echo "已安装 pto-auth-proxy.service；未启用、未启动"
+    fi
 fi
 
 echo "程序: $PREFIX"

@@ -86,8 +86,22 @@ sudo ./scripts/install.sh --init-config
 sudo ./scripts/install.sh --install-service
 ```
 
+安装 systemd unit 并设置开机自启动（不会立即启动或重启当前服务）：
+
+```bash
+sudo ./scripts/install.sh --init-config --enable-service
+```
+
+首次上线前先校验配置；确认生产端口未被其他进程占用后，再显式启动：
+
+```bash
+pto-auth-proxy validate
+sudo systemctl start pto-auth-proxy
+```
+
 管理员应先运行 `pto-auth-proxy validate`，再使用影子端口验证。停止旧服务、绑定
-生产端口、enable/start/restart 均属于单独的上线操作，不由安装器执行。
+生产端口和 start/restart 均属于单独的上线操作，不由安装器执行。只有显式传入
+`--enable-service` 时，安装器才会执行 `systemctl enable`。
 
 ## 配置
 

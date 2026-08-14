@@ -37,6 +37,21 @@ ss -lnt | grep -E ':(20808|20809|4780)\b'
 Inspect only credential-free fields when diagnosing configuration. Proxy URLs
 must always be redacted before display.
 
+## User commands
+
+Use the public command instead of asking users to locate or execute repository
+scripts directly:
+
+```bash
+pto-auth-proxy join
+pto-auth-proxy test
+```
+
+`join` is an explicit onboarding/repair operation: it installs and restarts the
+current user's `authd` and privately prompts in that user's terminal. `test` is
+an interactive end-to-end check and likewise requires the user to enter their
+own password locally. Never enter, capture, or relay that password for them.
+
 ## GitHub acceptance boundary
 
 Core GitHub access includes:
@@ -70,6 +85,12 @@ Before proposing a change:
 ## Deployment
 
 The repository installer copies code into the standard `pypto-tools` layout.
-It intentionally does not enable, start, stop, or restart the proxy. Production
-cutover requires a shadow-port test and an explicit rollback plan; follow the
-repository README and preserve the previous deployment until acceptance passes.
+By default it does not install, enable, start, stop, or restart the proxy
+service. `--install-service` installs the unit without enabling or starting it.
+`--enable-service` is the explicit administrator opt-in that installs the unit
+and enables it for boot, but still does not start or restart it immediately.
+
+Production cutover requires a shadow-port test and an explicit rollback plan;
+follow the repository README and preserve the previous deployment until
+acceptance passes. Treat the later `systemctl start` or `restart` as a separate
+state-changing operation requiring explicit user intent.

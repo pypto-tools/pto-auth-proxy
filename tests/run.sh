@@ -43,6 +43,10 @@ grep -Fq -- '--enable-service' "$PROJECT_DIR/scripts/install.sh"
 grep -Fq 'if ((ENABLE_SERVICE)); then' "$PROJECT_DIR/scripts/install.sh"
 grep -Fq 'systemctl enable pto-auth-proxy.service' \
     "$PROJECT_DIR/scripts/install.sh"
+grep -Fq 'pto-auth-proxy join' "$PROJECT_DIR/join-proxy.sh"
+grep -Fq 'pto-auth-proxy test' "$PROJECT_DIR/join-proxy.sh"
+grep -Fq 'pto-auth-proxy test' "$PROJECT_DIR/test_proxy.sh"
+grep -Fq -- '--enable-service' "$PROJECT_DIR/skills/pto-auth-proxy/SKILL.md"
 if grep -Fq 'PrivateTmp=true' "$PROJECT_DIR/systemd/pto-auth-proxy.service.in"; then
     echo "PrivateTmp 会隔离用户 authd socket" >&2
     exit 1

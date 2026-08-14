@@ -6,7 +6,7 @@
 # affecting anyone still using the old :4780 tunnel.
 #
 # Usage:
-#   bash test_proxy.sh
+#   pto-auth-proxy test
 set -u
 
 PROXY_HOST=${PTO_AUTH_PROXY_LISTEN_HOST:-127.0.0.1}
@@ -85,13 +85,12 @@ else
   info "  Possible causes:"
   info "  - wrong password"
   info "  - faillock lockout (from earlier failed attempts) — wait 60s and retry"
-  info "  - authd not running (run join-proxy.sh again)"
+  info "  - authd not running (run pto-auth-proxy join again)"
   exit 1
 fi
 
 info "Skipping the wrong-password check because it consumes faillock counters"
-info "(deny=3 unlock_time=60). If you want to verify auth actually rejects,"
-info "wait until AFTER Steps 4/5 and run:  bash $0 --check-reject"
+info "(deny=3 unlock_time=60)."
 
 # ---- 4. Whitelist checks -------------------------------------------------
 header "Step 4: service whitelist positive tests"

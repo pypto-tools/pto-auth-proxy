@@ -1,12 +1,16 @@
 [Unit]
 Description=Authenticated whitelist proxy
-After=network-online.target
-Wants=network-online.target
+After=network-online.target pto-auth-proxy-egress-guard.service
+Wants=network-online.target pto-auth-proxy-egress-guard.service
 
 [Service]
 Type=simple
+# User must match PTO_AUTH_PROXY_OWNER in auth-proxy.env. The shared proxy
+# intentionally does not run as root; Group grants access to authd sockets.
 User=@PROXY_USER@
 Group=@PROXY_GROUP@
+EnvironmentFile=-@TOOL_DIR@/config/auth-proxy.env
+ExecStartPre=+@PREFIX@/bin/pto-auth-proxy-egress-guard check @PROXY_USER@ ${PTO_AUTH_PROXY_GUARD_PORTS}
 ExecStart=@PREFIX@/bin/pto-auth-proxy run
 Restart=on-failure
 RestartSec=3

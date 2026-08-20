@@ -1,0 +1,13 @@
+[Unit]
+Description=Poll the repository rollout manifest for @NAME@
+After=time-sync.target
+
+[Timer]
+OnCalendar=*-*-* 03:37:00 Asia/Shanghai
+RandomizedDelaySec=20min
+AccuracySec=1min
+Persistent=false
+Unit=@SERVICE_NAME@
+
+[Install]
+WantedBy=timers.target

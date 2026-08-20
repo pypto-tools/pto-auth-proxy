@@ -1,0 +1,17 @@
+[Unit]
+Description=Restrict direct access to pto-auth-proxy upstream ports
+Before=pto-auth-proxy.service
+
+[Service]
+Type=simple
+Environment=PTO_AUTH_PROXY_GUARD_INTERVAL=30
+EnvironmentFile=-@TOOL_DIR@/config/auth-proxy.env
+ExecStartPre=@PREFIX@/bin/pto-auth-proxy-egress-guard start @PROXY_USER@ ${PTO_AUTH_PROXY_GUARD_PORTS}
+ExecStart=@PREFIX@/bin/pto-auth-proxy-egress-guard watch @PROXY_USER@ ${PTO_AUTH_PROXY_GUARD_PORTS}
+ExecReload=@PREFIX@/bin/pto-auth-proxy-egress-guard reload @PROXY_USER@ ${PTO_AUTH_PROXY_GUARD_PORTS}
+ExecStop=@PREFIX@/bin/pto-auth-proxy-egress-guard stop @PROXY_USER@ ${PTO_AUTH_PROXY_GUARD_PORTS}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

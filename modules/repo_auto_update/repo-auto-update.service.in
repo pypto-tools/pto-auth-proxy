@@ -1,0 +1,16 @@
+[Unit]
+Description=Stage a repository-controlled update for @NAME@
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@UPDATER@ @CONFIG@
+TimeoutStartSec=20min
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=@READ_WRITE_PATHS@
+NoNewPrivileges=false

@@ -1,0 +1,13 @@
+[Unit]
+Description=Start PTO Auth Proxy verifiers for authorized users
+After=local-fs.target nss-user-lookup.target
+Wants=nss-user-lookup.target
+Before=pto-auth-proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=@PREFIX@/bin/pto-auth-proxy-start-authd-members @PROXY_GROUP@ @PROXY_USER@
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+[Unit]
+Description=PTO Auth Proxy PAM verifier for user %I
+After=local-fs.target
+Before=pto-auth-proxy.service
+
+[Service]
+Type=simple
+# Each instance runs as the user it authenticates. Do not set Group or
+# SupplementaryGroups here: normal Unix group membership must remain the
+# authorization source, rather than granting proxyusers to an arbitrary unit.
+User=%I
+EnvironmentFile=-@TOOL_DIR@/config/auth-proxy.env
+# Remove only the legacy per-home implementation before binding the canonical
+# socket. The system service itself runs authd.py (without the authproxy-
+# prefix), so these patterns cannot match its MainPID.
+ExecStartPre=-/usr/bin/pkill -u %I -f authproxy-watchdog.sh
+ExecStartPre=-/usr/bin/pkill -u %I -f authproxy-authd.py
+ExecStart=/usr/bin/python3 @PREFIX@/auth-proxy/authd.py
+# A clean daemon exit outside an explicit systemctl stop should also recover.
+# systemd suppresses Restart= during an intentional stop/restart transaction.
+Restart=always
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=10
+
+# authd and the shared proxy must see the same /tmp/authproxy-<user>.sock.
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

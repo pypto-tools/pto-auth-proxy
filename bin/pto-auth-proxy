@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+SELF_DIR=$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
 PROJECT_DIR=$(cd -- "$SELF_DIR/.." && pwd)
 
 if [[ "${PROJECT_DIR##*/}" == app ]]; then
@@ -37,12 +38,24 @@ usage() {
   traffic [MINUTES] [--json] 查看近期流量排行
   report DATE               生成 today/yesterday/YYYY-MM-DD 报告
   join                      交互式安装并启动当前用户 authd
+  status                    一行检查组、authd、凭据、20809 和直连隔离
   test                      交互式端到端测试（含 GitHub 内容读取）
 EOF
 }
 
 valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+valid_seconds() {
+    python3 - "$1" <<'PY'
+import sys
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if 0.1 <= value <= 300 else 1)
+PY
 }
 
 load_config() {
@@ -64,6 +77,12 @@ load_config() {
     : "${PTO_AUTH_PROXY_HTTP_PORT:=20809}"
     : "${PTO_AUTH_PROXY_UPSTREAM_HOST:=127.0.0.1}"
     : "${PTO_AUTH_PROXY_UPSTREAM_PORT:=4780}"
+    : "${PTO_AUTH_PROXY_GUARD_PORTS:=${PTO_AUTH_PROXY_UPSTREAM_PORT},4781}"
+    : "${PTO_AUTH_PROXY_CLIENT_HANDSHAKE_TIMEOUT:=15}"
+    : "${PTO_AUTH_PROXY_UPSTREAM_CONNECT_TIMEOUT:=5}"
+    : "${PTO_AUTH_PROXY_UPSTREAM_HANDSHAKE_TIMEOUT:=10}"
+    : "${PTO_AUTH_PROXY_RELAY_HALF_CLOSE_TIMEOUT:=30}"
+    : "${PTO_AUTH_PROXY_CLOSE_TIMEOUT:=2}"
 
     export AUTHPROXY_DIR=${AUTHPROXY_DIR:-$DATA_DIR}
     export PTO_AUTH_PROXY_WHITELIST=${PTO_AUTH_PROXY_WHITELIST:-$DEFAULT_WHITELIST}
@@ -73,8 +92,21 @@ load_config() {
     export PTO_AUTH_PROXY_LOG_FILE=${PTO_AUTH_PROXY_LOG_FILE:-$LOG_DIR/auth_proxy.log}
 }
 
+validate_runtime_user() {
+    local current_user required_user
+    current_user=$(id -un)
+    required_user=${PTO_AUTH_PROXY_OWNER:-pypto}
+
+    if [[ "$current_user" != "$required_user" ]]; then
+        echo "错误: Auth Proxy 主进程必须以用户 $required_user 运行，当前用户为 $current_user" >&2
+        echo "请通过 systemd 启动，或使用: sudo -u $required_user pto-auth-proxy run" >&2
+        return 1
+    fi
+}
+
 validate() {
     load_config
+    validate_runtime_user
     [[ "$PTO_AUTH_PROXY_LISTEN_HOST" == 127.0.0.1 ||
        "$PTO_AUTH_PROXY_LISTEN_HOST" == ::1 ]] || {
         echo "拒绝非本机监听地址: $PTO_AUTH_PROXY_LISTEN_HOST" >&2
@@ -89,6 +121,27 @@ validate() {
     valid_port "$PTO_AUTH_PROXY_UPSTREAM_PORT" || {
         echo "上游端口无效: $PTO_AUTH_PROXY_UPSTREAM_PORT" >&2; return 1;
     }
+    local guard_port
+    IFS=, read -r -a guard_ports <<< "$PTO_AUTH_PROXY_GUARD_PORTS"
+    ((${#guard_ports[@]} > 0)) || {
+        echo "出口守卫端口不能为空" >&2; return 1;
+    }
+    for guard_port in "${guard_ports[@]}"; do
+        valid_port "$guard_port" || {
+            echo "出口守卫端口无效: $guard_port" >&2; return 1;
+        }
+    done
+    local timeout_name
+    for timeout_name in PTO_AUTH_PROXY_CLIENT_HANDSHAKE_TIMEOUT \
+                        PTO_AUTH_PROXY_UPSTREAM_CONNECT_TIMEOUT \
+                        PTO_AUTH_PROXY_UPSTREAM_HANDSHAKE_TIMEOUT \
+                        PTO_AUTH_PROXY_RELAY_HALF_CLOSE_TIMEOUT \
+                        PTO_AUTH_PROXY_CLOSE_TIMEOUT; do
+        valid_seconds "${!timeout_name}" || {
+            echo "$timeout_name 必须是 0.1 到 300 秒" >&2
+            return 1
+        }
+    done
     [[ "$PTO_AUTH_PROXY_SOCKS_PORT" != "$PTO_AUTH_PROXY_HTTP_PORT" ]] || {
         echo "SOCKS5 和 HTTP CONNECT 不能使用同一端口" >&2; return 1;
     }
@@ -130,6 +183,11 @@ case "$COMMAND" in
         load_config
         export PTO_AUTH_PROXY_SOURCE_DIR=$COMPONENT_DIR
         exec bash "$COMPONENT_DIR/join-proxy.sh"
+        ;;
+    status)
+        (($# == 0)) || { usage; exit 2; }
+        load_config
+        exec python3 "$COMPONENT_DIR/status_proxy.py"
         ;;
     test)
         (($# == 0)) || { usage; exit 2; }

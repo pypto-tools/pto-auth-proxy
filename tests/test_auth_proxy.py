@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import io
 import json
@@ -58,6 +59,34 @@ class ConfigurationTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 auth_proxy._env_port("TEST_PROXY_PORT", 1)
 
+    def test_timeout_validation(self):
+        with mock.patch.dict("os.environ", {"TEST_PROXY_TIMEOUT": "2.5"}):
+            self.assertEqual(
+                auth_proxy._env_seconds("TEST_PROXY_TIMEOUT", 1), 2.5)
+        with mock.patch.dict("os.environ", {"TEST_PROXY_TIMEOUT": "0"}):
+            with self.assertRaises(SystemExit):
+                auth_proxy._env_seconds("TEST_PROXY_TIMEOUT", 1)
+
+    def test_wrong_runtime_user_is_rejected(self):
+        current = mock.Mock(pw_name="someone-else")
+        with mock.patch.object(auth_proxy, "PROXY_OWNER", "pypto"), \
+             mock.patch.object(auth_proxy.os, "getuid", return_value=1234), \
+             mock.patch.object(auth_proxy.pwd, "getpwuid", return_value=current), \
+             mock.patch.object(auth_proxy, "log") as log:
+            with self.assertRaisesRegex(SystemExit, "1"):
+                auth_proxy.require_proxy_owner()
+
+        messages = "\n".join(call.args[0] for call in log.call_args_list)
+        self.assertIn("must run as user 'pypto'", messages)
+        self.assertIn("sudo -u pypto pto-auth-proxy run", messages)
+
+    def test_required_runtime_user_is_accepted(self):
+        current = mock.Mock(pw_name="pypto")
+        with mock.patch.object(auth_proxy, "PROXY_OWNER", "pypto"), \
+             mock.patch.object(auth_proxy.os, "getuid", return_value=1070), \
+             mock.patch.object(auth_proxy.pwd, "getpwuid", return_value=current):
+            auth_proxy.require_proxy_owner()
+
 
 class RecentDownloadRankingTest(unittest.TestCase):
     def setUp(self):
@@ -104,6 +133,87 @@ class RecentDownloadRankingTest(unittest.TestCase):
             auth_proxy.print_download_ranking(30)
         self.assertIn("最近 30 分钟", output.getvalue())
         self.assertIn("暂无", output.getvalue())
+
+
+class RelayLifecycleTest(unittest.IsolatedAsyncioTestCase):
+    class Writer:
+        def __init__(self):
+            self.data = bytearray()
+            self.eof_count = 0
+
+        def write(self, data):
+            self.data.extend(data)
+
+        async def drain(self):
+            return None
+
+        def can_write_eof(self):
+            return True
+
+        def write_eof(self):
+            self.eof_count += 1
+
+    async def test_relay_bounds_blocked_sibling_after_half_close(self):
+        left = asyncio.StreamReader()
+        left.feed_data(b"hello")
+        left.feed_eof()
+        right = asyncio.StreamReader()  # Intentionally never receives EOF.
+        left_writer = self.Writer()
+        right_writer = self.Writer()
+        uploaded, downloaded = [0], [0]
+
+        with mock.patch.object(auth_proxy, "RELAY_HALF_CLOSE_TIMEOUT", 0.01):
+            await asyncio.wait_for(
+                auth_proxy._relay(left, left_writer, right, right_writer,
+                                  uploaded, downloaded),
+                timeout=0.2)
+
+        self.assertEqual(right_writer.data, b"hello")
+        self.assertEqual(right_writer.eof_count, 1)
+        self.assertEqual(uploaded[0], 5)
+        self.assertEqual(downloaded[0], 0)
+
+    async def test_relay_keeps_response_after_client_half_close(self):
+        left = asyncio.StreamReader()
+        left.feed_data(b"request")
+        left.feed_eof()
+        right = asyncio.StreamReader()
+        left_writer = self.Writer()
+        right_writer = self.Writer()
+        uploaded, downloaded = [0], [0]
+
+        async def finish_response():
+            await asyncio.sleep(0.01)
+            right.feed_data(b"response")
+            right.feed_eof()
+
+        feeder = asyncio.create_task(finish_response())
+        await auth_proxy._relay(left, left_writer, right, right_writer,
+                                uploaded, downloaded)
+        await feeder
+
+        self.assertEqual(right_writer.data, b"request")
+        self.assertEqual(left_writer.data, b"response")
+        self.assertEqual(uploaded[0], 7)
+        self.assertEqual(downloaded[0], 8)
+        self.assertEqual(right_writer.eof_count, 1)
+        self.assertEqual(left_writer.eof_count, 1)
+
+    async def test_upstream_read_has_a_hard_timeout(self):
+        reader = asyncio.StreamReader()
+        with mock.patch.object(auth_proxy, "UPSTREAM_HANDSHAKE_TIMEOUT", 0.01):
+            with self.assertRaises(asyncio.TimeoutError):
+                await auth_proxy._upstream_readexactly(reader, 1)
+
+    async def test_http_header_reader_preserves_coalesced_payload(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            b"CONNECT github.com:443 HTTP/1.1\r\nHost: github.com\r\n\r\n"
+            b"first-tls-bytes")
+        line, headers, tail = await auth_proxy._read_http_headers(reader)
+        self.assertEqual(line, b"CONNECT github.com:443 HTTP/1.1")
+        self.assertEqual(headers, [b"Host: github.com"])
+        self.assertEqual(tail, b"first-tls-bytes")
 
 
 if __name__ == "__main__":

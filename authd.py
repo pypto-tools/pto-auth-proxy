@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Per-user PAM authentication daemon.
 
-Runs as an unprivileged Linux user (say `david`). Listens on a Unix socket
-whose path is either $XDG_RUNTIME_DIR/authproxy-authd.sock or, when systemd
-has not created a runtime dir, /tmp/authproxy-<username>.sock.
+Runs as an unprivileged Linux user (say `david`). System-managed instances
+listen below /run/pto-auth-proxy/<uid>/; legacy per-home instances retain the
+/tmp/authproxy-<username>.sock compatibility path.
 
 The socket is group-owned by `proxyusers` and mode 0660 so the auth_proxy
 process (running as pypto, who is also a member of proxyusers) can connect,
@@ -12,10 +12,10 @@ member could still connect and impersonate the proxy, on every incoming
 connection we additionally check SO_PEERCRED and require the caller's UID to
 be either `pypto` (the proxy owner) or ourselves (for self-tests).
 
-On each connection reads one JSON line `{"user": "<username>", "pass":
-"<password>"}` and replies `{"ok": true|false, "code": N, "reason": "..."}`.
-authd only ever verifies its own owner, so a stolen socket cannot be used to
-probe arbitrary users' passwords.
+Normal authentication remains compatible with `{"user": "<username>",
+"pass": "<credential>"}`. A self-call may also use `issue-token` after PAM
+verification; the returned random proxy token is stored only by the user and
+can be revoked without changing the Linux password.
 """
 from __future__ import annotations
 import asyncio
@@ -26,10 +26,12 @@ import hmac
 import json
 import os
 import pwd
+import secrets
 import signal
 import socket
 import struct
 import sys
+import tempfile
 import time
 
 import pam as _pam_mod
@@ -62,13 +64,36 @@ _SOCK_GROUP = os.environ.get("PTO_AUTH_PROXY_GROUP", "proxyusers")
 
 _UID = os.getuid()
 _MY_NAME = pwd.getpwuid(_UID).pw_name
+_MY_HOME = pwd.getpwuid(_UID).pw_dir
+_TOKEN_PREFIX = "pto_"
+_TOKEN_BYTES = 32
+_TOKEN_BODY_LENGTH = (_TOKEN_BYTES * 8 + 5) // 6
+_TOKEN_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+_TOKEN_DIR = os.path.join(_MY_HOME, ".config", "pto-auth-proxy")
+_TOKEN_HASH_FILE = os.path.join(_TOKEN_DIR, "token.sha256")
+_TOKEN_ROTATION_GRACE = 600
 
-# Always use /tmp/authproxy-<user>.sock. We used to prefer XDG_RUNTIME_DIR
-# (/run/user/<uid>/), but that directory is 0700 owned by the user, so the
-# auth_proxy process (running as pypto) cannot stat/connect there. /tmp is
-# world-readable so pypto can find and open the socket, and we lock it down
-# via chgrp proxyusers + chmod 0660 + SO_PEERCRED checks in handle().
-_SOCK = f"/tmp/authproxy-{_MY_NAME}.sock"
+_SYSTEM_RUNTIME_DIR = f"/run/pto-auth-proxy/{_UID}"
+_SYSTEM_SOCK = os.path.join(_SYSTEM_RUNTIME_DIR, "authd.sock")
+_LEGACY_SOCK = f"/tmp/authproxy-{_MY_NAME}.sock"
+
+
+def _choose_socket_path() -> str:
+    """Prefer an administrator-created, non-group-writable runtime directory."""
+    try:
+        runtime = os.stat(_SYSTEM_RUNTIME_DIR)
+    except OSError:
+        return _LEGACY_SOCK
+    if runtime.st_uid == _UID and runtime.st_mode & 0o022 == 0:
+        return _SYSTEM_SOCK
+    print(f"authd[{_MY_NAME}]: WARNING: refusing unsafe runtime directory "
+          f"{_SYSTEM_RUNTIME_DIR}; using legacy socket", flush=True)
+    return _LEGACY_SOCK
+
+
+_SOCK = _choose_socket_path()
 
 
 def log(msg: str) -> None:
@@ -115,6 +140,80 @@ def _cache_put(user: str, pw: str) -> None:
     _cache[(user, _pw_fingerprint(pw))] = time.monotonic() + CACHE_TTL
 
 
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _looks_like_proxy_token(credential: str) -> bool:
+    body = credential.removeprefix(_TOKEN_PREFIX)
+    return credential.startswith(_TOKEN_PREFIX) \
+        and len(body) == _TOKEN_BODY_LENGTH \
+        and all(char in _TOKEN_ALPHABET for char in body)
+
+
+def _token_matches(token: str) -> bool:
+    if not token.startswith(_TOKEN_PREFIX):
+        return False
+    try:
+        with open(_TOKEN_HASH_FILE, "r", encoding="ascii") as token_file:
+            stored = token_file.read().strip()
+    except (FileNotFoundError, OSError):
+        return False
+    digest = _token_digest(token)
+    try:
+        record = json.loads(stored)
+        if hmac.compare_digest(str(record.get("current", "")), digest):
+            return True
+        previous = str(record.get("previous", ""))
+        previous_until = float(record.get("previous_until", 0))
+        return previous_until >= time.time() and hmac.compare_digest(previous, digest)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        # Compatibility with the initial single-digest token file format.
+        return hmac.compare_digest(stored, digest)
+
+
+def _issue_proxy_token() -> str:
+    """Create a random token and atomically persist only its SHA-256 digest."""
+    os.makedirs(_TOKEN_DIR, mode=0o700, exist_ok=True)
+    os.chmod(_TOKEN_DIR, 0o700)
+    token = _TOKEN_PREFIX + secrets.token_urlsafe(_TOKEN_BYTES)
+    previous = ""
+    try:
+        with open(_TOKEN_HASH_FILE, "r", encoding="ascii") as token_file:
+            stored = token_file.read().strip()
+        try:
+            previous = str(json.loads(stored).get("current", ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            previous = stored
+    except OSError:
+        pass
+    record = {
+        "version": 1,
+        "current": _token_digest(token),
+        "previous": previous,
+        "previous_until": time.time() + _TOKEN_ROTATION_GRACE if previous else 0,
+    }
+    fd, temp_path = tempfile.mkstemp(prefix=".token-sha256.", dir=_TOKEN_DIR,
+                                     text=True)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as token_file:
+            json.dump(record, token_file, separators=(",", ":"))
+            token_file.write("\n")
+        os.replace(temp_path, _TOKEN_HASH_FILE)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+    return token
+
+
 # Dedicated pool -- default asyncio executor is single-threaded and would
 # serialize all PAM calls.
 _pam_pool = concurrent.futures.ThreadPoolExecutor(
@@ -133,6 +232,39 @@ def _pam_call(user: str, password: str):
     return (bool(ok),
             getattr(p, "code", None),
             getattr(p, "reason", None))
+
+
+async def _pam_call_async(user: str, password: str):
+    try:
+        return await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                _pam_pool, _pam_call, user, password),
+            timeout=PAM_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return False, -4, f"pam timeout >{PAM_TIMEOUT}s"
+
+
+async def _authenticate(user: str, credential: str):
+    """Authenticate a token when it matches, otherwise preserve PAM fallback."""
+    if _looks_like_proxy_token(credential):
+        ok = _token_matches(credential)
+        return {
+            "ok": ok,
+            "code": 0 if ok else -6,
+            "reason": "token" if ok else "invalid proxy token",
+        }, "token"
+    if _cache_get(user, credential):
+        return {"ok": True, "code": 0, "reason": "cache"}, "cache"
+
+    # The short prefix is not reserved: an existing Linux password may start
+    # with ``pto_``. Only the full generated token shape bypasses PAM. This
+    # preserves such passwords without sending stale, token-shaped secrets to
+    # PAM repeatedly and risking an account lockout.
+    ok, code, reason = await _pam_call_async(user, credential)
+    if ok:
+        _cache_put(user, credential)
+    return {"ok": ok, "code": code, "reason": reason}, "pam"
 
 
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -164,36 +296,36 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
     try:
         line = await asyncio.wait_for(reader.readline(), timeout=5)
         req = json.loads(line.decode("utf-8"))
+        op = str(req.get("op", "authenticate"))
         user = str(req.get("user", ""))
-        password = str(req.get("pass", ""))
+        credential = str(req.get("pass", ""))
+        via = "protocol"
 
-        if user != _MY_NAME:
+        if op == "capabilities":
+            reply = {"ok": True, "code": 0,
+                     "capabilities": ["token-v1"]}
+        elif user != _MY_NAME:
             reply = {"ok": False, "code": -1,
                      "reason": f"authd for {_MY_NAME!r} refuses to verify {user!r}"}
-        elif _cache_get(user, password):
-            # Cache hit: same (user, password) succeeded in the last CACHE_TTL
-            # seconds. Skip PAM entirely -- this is what makes bursty
-            # workloads (Claude Code, npm install, etc.) fast.
-            reply = {"ok": True, "code": 0, "reason": "cache"}
+        elif op == "issue-token":
+            if peer_uid != _UID:
+                reply = {"ok": False, "code": -5,
+                         "reason": "only the user may issue their proxy token"}
+            else:
+                ok, code, reason = await _pam_call_async(user, credential)
+                via = "pam"
+                reply = {"ok": ok, "code": code, "reason": reason}
+                if ok:
+                    _cache_put(user, credential)
+                    reply["token"] = _issue_proxy_token()
+        elif op != "authenticate":
+            reply = {"ok": False, "code": -7,
+                     "reason": f"unsupported operation: {op}"}
         else:
-            # Fresh PAM call in the dedicated pool (parallelism=PAM_WORKERS)
-            # with a hard timeout so a hung unix_chkpwd cannot stall the
-            # event loop.
-            try:
-                ok, code, reason = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(
-                        _pam_pool, _pam_call, user, password),
-                    timeout=PAM_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                ok, code, reason = False, -4, f"pam timeout >{PAM_TIMEOUT}s"
-            reply = {"ok": ok, "code": code, "reason": reason}
-            if ok:
-                _cache_put(user, password)
+            reply, via = await _authenticate(user, credential)
 
         writer.write((json.dumps(reply) + "\n").encode("utf-8"))
         await writer.drain()
-        via = "cache" if reply.get("reason") == "cache" else "pam"
         log(f"peer_uid={peer_uid} user={user!r} -> ok={reply['ok']} code={reply.get('code')} via={via}")
     except Exception as e:
         try:
@@ -211,10 +343,11 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
 
 
 async def main() -> None:
-    # Ensure parent dir exists (only relevant for the /tmp fallback).
+    # The secure /run directory is created by the root member starter. The
+    # fallback's parent is /tmp and already exists on a normal system.
     parent = os.path.dirname(_SOCK)
     if parent and not os.path.isdir(parent):
-        os.makedirs(parent, exist_ok=True)
+        raise RuntimeError(f"authd socket directory is missing: {parent}")
     try:
         os.unlink(_SOCK)
     except FileNotFoundError:

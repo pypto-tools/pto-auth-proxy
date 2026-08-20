@@ -45,6 +45,17 @@ def _env_port(name: str, default: int) -> int:
     return value
 
 
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a number, got {raw!r}") from exc
+    if not 0.1 <= value <= 300:
+        raise SystemExit(f"{name} must be between 0.1 and 300 seconds, got {value}")
+    return value
+
+
 BASE_DIR       = Path(os.environ.get("AUTHPROXY_DIR",
                                      Path.home() / "auth-proxy")).resolve()
 WHITELIST_FILE = Path(os.environ.get(
@@ -73,10 +84,23 @@ REPORT_MINUTE = 5
 LISTEN_HOST    = os.environ.get("PTO_AUTH_PROXY_LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT    = _env_port("PTO_AUTH_PROXY_SOCKS_PORT", 20808)
 HTTP_LISTEN_PORT = _env_port("PTO_AUTH_PROXY_HTTP_PORT", 20809)
+# Every allowed business connection is chained through this SOCKS5 endpoint.
+# On the production host, 127.0.0.1:4780 is the local landing of an SSH
+# RemoteForward to the workstation's xray; it is not created by this process.
 UPSTREAM_HOST  = os.environ.get("PTO_AUTH_PROXY_UPSTREAM_HOST", "127.0.0.1")
 UPSTREAM_PORT  = _env_port("PTO_AUTH_PROXY_UPSTREAM_PORT", 4780)
+PROXY_OWNER    = os.environ.get("PTO_AUTH_PROXY_OWNER", "pypto")
 PROXY_GROUP    = os.environ.get("PTO_AUTH_PROXY_GROUP", "proxyusers")
 PAM_SERVICE    = os.environ.get("PTO_AUTH_PROXY_PAM_SERVICE", "sshd")
+CLIENT_HANDSHAKE_TIMEOUT = _env_seconds(
+    "PTO_AUTH_PROXY_CLIENT_HANDSHAKE_TIMEOUT", 15)
+UPSTREAM_CONNECT_TIMEOUT = _env_seconds(
+    "PTO_AUTH_PROXY_UPSTREAM_CONNECT_TIMEOUT", 5)
+UPSTREAM_HANDSHAKE_TIMEOUT = _env_seconds(
+    "PTO_AUTH_PROXY_UPSTREAM_HANDSHAKE_TIMEOUT", 10)
+RELAY_HALF_CLOSE_TIMEOUT = _env_seconds(
+    "PTO_AUTH_PROXY_RELAY_HALF_CLOSE_TIMEOUT", 30)
+CLOSE_TIMEOUT = _env_seconds("PTO_AUTH_PROXY_CLOSE_TIMEOUT", 2)
 
 DEFAULT_WHITELIST = [
     # Anthropic / Claude
@@ -132,22 +156,31 @@ async def pam_check_async(user: str, password: str) -> bool:
         log(f"pam_check_async: unknown user {user!r}")
         return False
 
-    # Look for the target user's authd socket in /tmp/authproxy-<user>.sock.
-    # We do NOT check /run/user/<uid>/... because that directory is 0700 so
-    # this process (running as pypto) cannot even stat inside it. The /tmp
-    # socket is chgrp proxyusers + 0660, and authd verifies SO_PEERCRED so
-    # only the actual proxy owner can call it.
-    sock_path = f"/tmp/authproxy-{user}.sock"
-    if not os.path.exists(sock_path):
-        log(f"pam_check_async: {user}'s authd not running "
-            f"(missing {sock_path})")
-        return False
+    # System-managed authd instances use a root-created per-user directory.
+    # Keep the /tmp location as a compatibility fallback for old joins.
+    socket_candidates = (
+        f"/run/pto-auth-proxy/{pwent.pw_uid}/authd.sock",
+        f"/tmp/authproxy-{user}.sock",
+    )
+    sock_path = None
+    r = w = None
+    connect_errors = []
+    for candidate in socket_candidates:
+        if not os.path.exists(candidate):
+            continue
+        try:
+            r, w = await asyncio.wait_for(
+                asyncio.open_unix_connection(candidate), timeout=3)
+            sock_path = candidate
+            break
+        except (OSError, asyncio.TimeoutError) as exc:
+            connect_errors.append(f"{candidate}: {exc}")
 
-    try:
-        r, w = await asyncio.open_unix_connection(sock_path)
-    except OSError as e:
-        log(f"pam_check_async: cannot connect to {sock_path}: {e}")
+    if sock_path is None:
+        log(f"pam_check_async: {user}'s authd not running "
+            f"({'; '.join(connect_errors) if connect_errors else 'missing sockets'})")
         return False
+    assert r is not None and w is not None
 
     try:
         # Verify the socket really is owned by the claimed user.
@@ -175,10 +208,7 @@ async def pam_check_async(user: str, password: str) -> bool:
         log(f"pam_check_async exception user={user}: {e!r}")
         return False
     finally:
-        try:
-            w.close()
-        except Exception:
-            pass
+        await _close_writer(w)
 
 
 def pam_check(user: str, password: str) -> bool:
@@ -268,37 +298,116 @@ def record(entry: dict) -> None:
         log(f"stats write failed: {e}")
 
 
+def require_proxy_owner() -> None:
+    """Refuse to run the shared proxy under the wrong Unix account."""
+    uid = os.getuid()
+    try:
+        current_user = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        current_user = f"uid={uid}"
+
+    if current_user != PROXY_OWNER:
+        log(f"ERROR: auth_proxy must run as user {PROXY_OWNER!r}, "
+            f"not {current_user!r}")
+        log(f"Current: {current_user} (uid={uid})")
+        log(f"Required: {PROXY_OWNER}")
+        log(f"To fix: sudo -u {PROXY_OWNER} pto-auth-proxy run")
+        raise SystemExit(1)
+
+
 # ============================================================
 # SOCKS5 request handling
 # ============================================================
+async def _close_writer(writer: Optional[asyncio.StreamWriter]) -> None:
+    if writer is None:
+        return
+    try:
+        writer.close()
+        await asyncio.wait_for(writer.wait_closed(), timeout=CLOSE_TIMEOUT)
+    except (AttributeError, OSError, asyncio.TimeoutError):
+        pass
+
+
 async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter,
                 counter: list[int]) -> None:
+    reached_eof = False
     try:
         while True:
             data = await src.read(65536)
             if not data:
+                reached_eof = True
                 break
             counter[0] += len(data)
             dst.write(data)
             await dst.drain()
-    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError,
-            asyncio.IncompleteReadError):
+    except asyncio.CancelledError:
+        raise
+    except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
         pass
     finally:
-        try:
-            dst.close()
-        except Exception:
-            pass
+        if reached_eof:
+            try:
+                if dst.can_write_eof():
+                    dst.write_eof()
+                    await asyncio.wait_for(
+                        dst.drain(), timeout=CLOSE_TIMEOUT)
+            except (AttributeError, OSError, RuntimeError,
+                    asyncio.TimeoutError):
+                pass
+
+
+async def _relay(left_reader: asyncio.StreamReader,
+                 left_writer: asyncio.StreamWriter,
+                 right_reader: asyncio.StreamReader,
+                 right_writer: asyncio.StreamWriter,
+                 left_to_right: list[int],
+                 right_to_left: list[int]) -> None:
+    """Relay both directions, preserving TCP half-close with a bounded wait."""
+    tasks = {
+        asyncio.create_task(_pipe(left_reader, right_writer, left_to_right)),
+        asyncio.create_task(_pipe(right_reader, left_writer, right_to_left)),
+    }
+    try:
+        _done, pending = await asyncio.wait(
+            tasks, return_when=asyncio.FIRST_COMPLETED)
+        if pending:
+            _finished, pending = await asyncio.wait(
+                pending, timeout=RELAY_HALF_CLOSE_TIMEOUT)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _client_readexactly(reader: asyncio.StreamReader, count: int) -> bytes:
+    return await asyncio.wait_for(
+        reader.readexactly(count), timeout=CLIENT_HANDSHAKE_TIMEOUT)
+
+
+async def _upstream_readexactly(reader: asyncio.StreamReader, count: int) -> bytes:
+    return await asyncio.wait_for(
+        reader.readexactly(count), timeout=UPSTREAM_HANDSHAKE_TIMEOUT)
+
+
+async def _upstream_drain(writer: asyncio.StreamWriter) -> None:
+    await asyncio.wait_for(
+        writer.drain(), timeout=UPSTREAM_HANDSHAKE_TIMEOUT)
 
 
 async def _read_addr(r: asyncio.StreamReader, atyp: int) -> str:
     if atyp == 0x01:
-        return socket.inet_ntoa(await r.readexactly(4))
+        return socket.inet_ntoa(await _client_readexactly(r, 4))
     if atyp == 0x03:
-        ln = (await r.readexactly(1))[0]
-        return (await r.readexactly(ln)).decode("ascii", errors="replace")
+        ln = (await _client_readexactly(r, 1))[0]
+        return (await _client_readexactly(r, ln)).decode(
+            "ascii", errors="replace")
     if atyp == 0x04:
-        return socket.inet_ntop(socket.AF_INET6, await r.readexactly(16))
+        return socket.inet_ntop(
+            socket.AF_INET6, await _client_readexactly(r, 16))
     raise ValueError(f"bad atyp {atyp}")
 
 
@@ -313,10 +422,10 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
 
     try:
         # 1. Greeting
-        ver, nmethods = await cr.readexactly(2)
+        ver, nmethods = await _client_readexactly(cr, 2)
         if ver != 0x05:
             return
-        methods = await cr.readexactly(nmethods)
+        methods = await _client_readexactly(cr, nmethods)
         if 0x02 not in methods:
             cw.write(b"\x05\xFF")
             await cw.drain()
@@ -326,13 +435,15 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
         await cw.drain()
 
         # 2. USERNAME/PASSWORD (RFC 1929)
-        v = (await cr.readexactly(1))[0]
+        v = (await _client_readexactly(cr, 1))[0]
         if v != 0x01:
             return
-        ulen = (await cr.readexactly(1))[0]
-        user = (await cr.readexactly(ulen)).decode("utf-8", errors="replace")
-        plen = (await cr.readexactly(1))[0]
-        pw   = (await cr.readexactly(plen)).decode("utf-8", errors="replace")
+        ulen = (await _client_readexactly(cr, 1))[0]
+        user = (await _client_readexactly(cr, ulen)).decode(
+            "utf-8", errors="replace")
+        plen = (await _client_readexactly(cr, 1))[0]
+        pw = (await _client_readexactly(cr, plen)).decode(
+            "utf-8", errors="replace")
 
         # 2a. Must be a member of PROXY_GROUP
         if not in_group(user):
@@ -354,7 +465,7 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
         await cw.drain()
 
         # 3. Request header
-        hdr = await cr.readexactly(4)
+        hdr = await _client_readexactly(cr, 4)
         if hdr[0] != 0x05 or hdr[1] != 0x01:
             cw.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
             await cw.drain()
@@ -368,7 +479,7 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
             await cw.drain()
             verdict = "atyp_unsupp"
             return
-        port = struct.unpack("!H", await cr.readexactly(2))[0]
+        port = struct.unpack("!H", await _client_readexactly(cr, 2))[0]
 
         # 4. Whitelist check
         if not host_allowed(host):
@@ -380,9 +491,10 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
 
         # 5. Connect upstream, do plain SOCKS5 handshake, forward CONNECT
         try:
-            up_reader, up_writer = await asyncio.open_connection(
-                UPSTREAM_HOST, UPSTREAM_PORT)
-        except OSError as e:
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection(UPSTREAM_HOST, UPSTREAM_PORT),
+                timeout=UPSTREAM_CONNECT_TIMEOUT)
+        except (OSError, asyncio.TimeoutError) as e:
             cw.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
             await cw.drain()
             verdict = "upstream_dead"
@@ -390,8 +502,8 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
             return
 
         up_writer.write(b"\x05\x01\x00")
-        await up_writer.drain()
-        if (await up_reader.readexactly(2)) != b"\x05\x00":
+        await _upstream_drain(up_writer)
+        if (await _upstream_readexactly(up_reader, 2)) != b"\x05\x00":
             cw.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
             await cw.drain()
             verdict = "upstream_authneg"
@@ -405,18 +517,18 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
             addr_bytes = socket.inet_pton(socket.AF_INET6, host)
         up_writer.write(b"\x05\x01\x00" + bytes([atyp]) + addr_bytes
                         + struct.pack("!H", port))
-        await up_writer.drain()
+        await _upstream_drain(up_writer)
 
-        rep = await up_reader.readexactly(4)
+        rep = await _upstream_readexactly(up_reader, 4)
         cw.write(rep)
         rep_atyp = rep[3]
         if rep_atyp == 0x01:
-            cw.write(await up_reader.readexactly(4 + 2))
+            cw.write(await _upstream_readexactly(up_reader, 4 + 2))
         elif rep_atyp == 0x03:
-            ln = (await up_reader.readexactly(1))[0]
-            cw.write(bytes([ln]) + await up_reader.readexactly(ln + 2))
+            ln = (await _upstream_readexactly(up_reader, 1))[0]
+            cw.write(bytes([ln]) + await _upstream_readexactly(up_reader, ln + 2))
         elif rep_atyp == 0x04:
-            cw.write(await up_reader.readexactly(16 + 2))
+            cw.write(await _upstream_readexactly(up_reader, 16 + 2))
         else:
             verdict = "upstream_bad_reply"
             return
@@ -430,26 +542,18 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
         log(f"ALLOW user={user} -> {host}:{port}")
 
         # 6. Full-duplex
-        await asyncio.gather(
-            _pipe(cr, up_writer, up_bytes),
-            _pipe(up_reader, cw, down_bytes),
-            return_exceptions=True,
-        )
+        await _relay(cr, cw, up_reader, up_writer, up_bytes, down_bytes)
 
     except (asyncio.IncompleteReadError, ConnectionResetError):
         pass
+    except asyncio.TimeoutError:
+        verdict = "timeout"
+        log(f"TIMEOUT user={user} host={host}:{port}")
     except Exception as e:
         log(f"ERROR user={user} host={host}:{port}: {e!r}")
     finally:
-        try:
-            cw.close()
-        except Exception:
-            pass
-        if up_writer is not None:
-            try:
-                up_writer.close()
-            except Exception:
-                pass
+        await _close_writer(cw)
+        await _close_writer(up_writer)
         record({
             "user": user,
             "peer": peer_str,
@@ -476,11 +580,13 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
 import base64 as _b64
 
 async def _read_http_headers(reader: asyncio.StreamReader,
-                             max_bytes: int = 16 * 1024) -> tuple[bytes, list[bytes]]:
-    """Read request-line + headers up to CRLFCRLF. Returns (request_line, header_lines)."""
+                             max_bytes: int = 16 * 1024
+                             ) -> tuple[bytes, list[bytes], bytes]:
+    """Return request line, headers, and any coalesced tunnel payload."""
     buf = b""
     while b"\r\n\r\n" not in buf:
-        chunk = await reader.read(4096)
+        chunk = await asyncio.wait_for(
+            reader.read(4096), timeout=CLIENT_HANDSHAKE_TIMEOUT)
         if not chunk:
             break
         buf += chunk
@@ -488,9 +594,9 @@ async def _read_http_headers(reader: asyncio.StreamReader,
             raise ValueError("headers too large")
     if b"\r\n\r\n" not in buf:
         raise ValueError("incomplete headers")
-    head, _, _tail = buf.partition(b"\r\n\r\n")
+    head, _, tail = buf.partition(b"\r\n\r\n")
     lines = head.split(b"\r\n")
-    return lines[0], lines[1:]
+    return lines[0], lines[1:], tail
 
 
 async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
@@ -515,7 +621,7 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> Non
             pass
 
     try:
-        request_line, header_lines = await _read_http_headers(cr)
+        request_line, header_lines, initial_payload = await _read_http_headers(cr)
         parts = request_line.split(b" ")
         if len(parts) < 3:
             verdict = "bad_request"
@@ -597,9 +703,10 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> Non
 
         # Connect upstream (SOCKS5) and do CONNECT via it
         try:
-            up_reader, up_writer = await asyncio.open_connection(
-                UPSTREAM_HOST, UPSTREAM_PORT)
-        except OSError as e:
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection(UPSTREAM_HOST, UPSTREAM_PORT),
+                timeout=UPSTREAM_CONNECT_TIMEOUT)
+        except (OSError, asyncio.TimeoutError) as e:
             verdict = "upstream_dead"
             log(f"HTTP UPSTREAM-DEAD user={user} -> {host}:{port}: {e}")
             await _reply("502 Bad Gateway", "upstream tunnel unreachable\n")
@@ -607,25 +714,25 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> Non
 
         # SOCKS5 no-auth handshake
         up_writer.write(b"\x05\x01\x00")
-        await up_writer.drain()
-        if (await up_reader.readexactly(2)) != b"\x05\x00":
+        await _upstream_drain(up_writer)
+        if (await _upstream_readexactly(up_reader, 2)) != b"\x05\x00":
             verdict = "upstream_authneg"
             await _reply("502 Bad Gateway", "upstream socks handshake failed\n")
             return
 
         addr_bytes = bytes([len(host)]) + host.encode("ascii")
         up_writer.write(b"\x05\x01\x00\x03" + addr_bytes + struct.pack("!H", port))
-        await up_writer.drain()
+        await _upstream_drain(up_writer)
 
-        rep = await up_reader.readexactly(4)
+        rep = await _upstream_readexactly(up_reader, 4)
         rep_atyp = rep[3]
         if rep_atyp == 0x01:
-            await up_reader.readexactly(4 + 2)
+            await _upstream_readexactly(up_reader, 4 + 2)
         elif rep_atyp == 0x03:
-            ln = (await up_reader.readexactly(1))[0]
-            await up_reader.readexactly(ln + 2)
+            ln = (await _upstream_readexactly(up_reader, 1))[0]
+            await _upstream_readexactly(up_reader, ln + 2)
         elif rep_atyp == 0x04:
-            await up_reader.readexactly(16 + 2)
+            await _upstream_readexactly(up_reader, 16 + 2)
 
         if rep[1] != 0x00:
             verdict = f"upstream_rep_{rep[1]}"
@@ -640,29 +747,29 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> Non
         verdict = "ok"
         log(f"HTTP ALLOW user={user} -> {host}:{port}")
 
-        await asyncio.gather(
-            _pipe(cr, up_writer, up_bytes),
-            _pipe(up_reader, cw, down_bytes),
-            return_exceptions=True,
-        )
+        # A client may coalesce the first TLS bytes with the CONNECT headers.
+        # Preserve them instead of silently dropping them during header parsing.
+        if initial_payload:
+            up_bytes[0] += len(initial_payload)
+            up_writer.write(initial_payload)
+            await up_writer.drain()
+
+        await _relay(cr, cw, up_reader, up_writer, up_bytes, down_bytes)
 
     except (asyncio.IncompleteReadError, ConnectionResetError, ValueError) as e:
         if verdict == "?":
             verdict = f"proto_err:{type(e).__name__}"
+    except asyncio.TimeoutError:
+        verdict = "timeout"
+        log(f"HTTP TIMEOUT user={user} host={host}:{port}")
+        await _reply("504 Gateway Timeout", "proxy operation timed out\n")
     except Exception as e:
         log(f"HTTP ERROR user={user} host={host}:{port}: {e!r}")
         if verdict == "?":
             verdict = f"exc:{type(e).__name__}"
     finally:
-        try:
-            cw.close()
-        except Exception:
-            pass
-        if up_writer is not None:
-            try:
-                up_writer.close()
-            except Exception:
-                pass
+        await _close_writer(cw)
+        await _close_writer(up_writer)
         record({
             "user": user,
             "peer": peer_str,
@@ -1071,6 +1178,7 @@ def _generate_report(day: _dt.date) -> None:
 
 # ============================================================
 async def main() -> None:
+    require_proxy_owner()
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     # Best-effort chgrp so proxyusers can read reports/alerts (needs the

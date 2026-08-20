@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "enabled": false,
+  "enabled": true,
   "target": "",
   "activation": "next-restart",
   "sequence": 0,

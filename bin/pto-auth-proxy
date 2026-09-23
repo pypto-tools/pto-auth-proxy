@@ -38,6 +38,7 @@ usage() {
   traffic [MINUTES] [--json] 查看近期流量排行
   report DATE               生成 today/yesterday/YYYY-MM-DD 报告
   join                      交互式安装并启动当前用户 authd
+  leave                     注销当前用户，撤销凭据并清理 shell 配置
   status                    一行检查组、authd、凭据、20809 和直连隔离
   test                      交互式端到端测试（含 GitHub 内容读取）
 EOF
@@ -183,6 +184,10 @@ case "$COMMAND" in
         load_config
         export PTO_AUTH_PROXY_SOURCE_DIR=$COMPONENT_DIR
         exec bash "$COMPONENT_DIR/join-proxy.sh"
+        ;;
+    leave|logout)
+        (($# == 0)) || { usage; exit 2; }
+        exec bash "$COMPONENT_DIR/leave-proxy.sh"
         ;;
     status)
         (($# == 0)) || { usage; exit 2; }

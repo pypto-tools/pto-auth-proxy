@@ -7,6 +7,7 @@ for file in \
     "$PROJECT_DIR/bin/pto-auth-proxy" \
     "$PROJECT_DIR/configure-shell.sh" \
     "$PROJECT_DIR/join-proxy.sh" \
+    "$PROJECT_DIR/leave-proxy.sh" \
     "$PROJECT_DIR/test_proxy.sh" \
     "$PROJECT_DIR/scripts/egress-guard.sh" \
     "$PROJECT_DIR/scripts/auto-update-adapter.sh" \
@@ -184,6 +185,9 @@ grep -Fq 'authproxy-watchdog.sh' "$PROJECT_DIR/join-proxy.sh"
 grep -Fq 'authproxy-authd.py' "$PROJECT_DIR/join-proxy.sh"
 grep -Fq 'configure-shell.sh' "$PROJECT_DIR/join-proxy.sh"
 grep -Fq 'issue-token' "$PROJECT_DIR/join-proxy.sh"
+grep -Fq 'leave-proxy.sh' "$PROJECT_DIR/bin/pto-auth-proxy"
+grep -Fq 'access.disabled' "$PROJECT_DIR/leave-proxy.sh"
+grep -Fq 'leave-proxy.sh' "$PROJECT_DIR/scripts/install.sh"
 grep -Fq 'status_proxy.py' "$PROJECT_DIR/bin/pto-auth-proxy"
 grep -Fq 'pto-auth-proxy test' "$PROJECT_DIR/test_proxy.sh"
 grep -Fq -- '--enable-service' "$PROJECT_DIR/skills/pto-auth-proxy/SKILL.md"
@@ -278,5 +282,29 @@ if printf '%s' 'must-not-persist' | \
     exit 1
 fi
 [[ ! -e "$BAD_HOME/.config/pto-auth-proxy/secret-uri" ]]
+
+# Leaving must revoke the token, retain unrelated shell content, remove only
+# managed proxy blocks, and remain safe to repeat.
+printf '%s\n' 'fake-token-digest' \
+    >"$SHELL_HOME/.config/pto-auth-proxy/token.sha256"
+HOME="$SHELL_HOME" SHELL=/bin/bash \
+    PTO_AUTH_PROXY_SHELL_RC="$SHELL_HOME/.bashrc" \
+    PTO_AUTH_PROXY_LEAVE_SKIP_PROCESS_STOP=1 \
+    "$PROJECT_DIR/leave-proxy.sh" >/dev/null
+[[ -e "$SHELL_HOME/.config/pto-auth-proxy/access.disabled" ]]
+[[ $(stat -c '%a' \
+    "$SHELL_HOME/.config/pto-auth-proxy/access.disabled") == 600 ]]
+[[ ! -e "$SHELL_HOME/.config/pto-auth-proxy/token.sha256" ]]
+[[ ! -e "$SHELL_HOME/.config/pto-auth-proxy/secret-uri" ]]
+[[ ! -e "$SHELL_HOME/.config/pto-auth-proxy/env.sh" ]]
+grep -Fqx '# existing user content' "$SHELL_HOME/.bashrc"
+if grep -Fq 'pto-auth-proxy managed environment' "$SHELL_HOME/.bashrc"; then
+    echo "leave did not remove the managed shell block" >&2
+    exit 1
+fi
+HOME="$SHELL_HOME" SHELL=/bin/bash \
+    PTO_AUTH_PROXY_SHELL_RC="$SHELL_HOME/.bashrc" \
+    PTO_AUTH_PROXY_LEAVE_SKIP_PROCESS_STOP=1 \
+    "$PROJECT_DIR/leave-proxy.sh" >/dev/null
 
 echo "All tests passed"

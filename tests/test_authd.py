@@ -1,4 +1,3 @@
-import asyncio
 import stat
 import tempfile
 import unittest
@@ -13,13 +12,18 @@ class ProxyTokenTest(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.token_dir = Path(self.tempdir.name) / "pto-auth-proxy"
         self.token_file = self.token_dir / "token.sha256"
+        self.disabled_file = self.token_dir / "access.disabled"
         self.dir_patch = mock.patch.object(authd, "_TOKEN_DIR", str(self.token_dir))
         self.file_patch = mock.patch.object(
             authd, "_TOKEN_HASH_FILE", str(self.token_file))
+        self.disabled_patch = mock.patch.object(
+            authd, "_DISABLED_FILE", str(self.disabled_file))
         self.dir_patch.start()
         self.file_patch.start()
+        self.disabled_patch.start()
 
     def tearDown(self):
+        self.disabled_patch.stop()
         self.file_patch.stop()
         self.dir_patch.stop()
         self.tempdir.cleanup()
@@ -51,11 +55,37 @@ class ProxyTokenTest(unittest.TestCase):
             self.assertFalse(authd._token_matches(first))
             self.assertTrue(authd._token_matches(second))
 
+    def test_disable_revokes_tokens_and_enable_clears_marker(self):
+        token = authd._issue_proxy_token()
+        self.assertTrue(authd._token_matches(token))
+
+        authd._disable_proxy_access()
+
+        self.assertTrue(authd._access_disabled())
+        self.assertFalse(self.token_file.exists())
+        self.assertEqual(
+            stat.S_IMODE(self.disabled_file.stat().st_mode), 0o600)
+        authd._enable_proxy_access()
+        self.assertFalse(authd._access_disabled())
+
 
 class CredentialFallbackTest(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_access_never_calls_token_or_pam(self):
+        with mock.patch.object(authd, "_access_disabled", return_value=True), \
+             mock.patch.object(authd, "_token_matches") as token_matches, \
+             mock.patch.object(authd, "_pam_call_async") as pam_call:
+            reply, via = await authd._authenticate("alice", "password")
+
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["code"], -8)
+        self.assertEqual(via, "disabled")
+        token_matches.assert_not_called()
+        pam_call.assert_not_called()
+
     async def test_matching_token_does_not_call_pam(self):
         token = "pto_" + "A" * authd._TOKEN_BODY_LENGTH
-        with mock.patch.object(authd, "_token_matches", return_value=True), \
+        with mock.patch.object(authd, "_access_disabled", return_value=False), \
+             mock.patch.object(authd, "_token_matches", return_value=True), \
              mock.patch.object(authd, "_pam_call_async") as pam_call:
             reply, via = await authd._authenticate("alice", token)
 
@@ -64,7 +94,8 @@ class CredentialFallbackTest(unittest.IsolatedAsyncioTestCase):
         pam_call.assert_not_called()
 
     async def test_password_with_token_prefix_falls_back_to_pam(self):
-        with mock.patch.object(authd, "_token_matches", return_value=False), \
+        with mock.patch.object(authd, "_access_disabled", return_value=False), \
+             mock.patch.object(authd, "_token_matches", return_value=False), \
              mock.patch.object(authd, "_cache_get", return_value=False), \
              mock.patch.object(authd, "_cache_put") as cache_put, \
              mock.patch.object(
@@ -79,7 +110,8 @@ class CredentialFallbackTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_stale_token_shape_does_not_fall_through_to_pam(self):
         token = "pto_" + "A" * authd._TOKEN_BODY_LENGTH
-        with mock.patch.object(authd, "_token_matches", return_value=False), \
+        with mock.patch.object(authd, "_access_disabled", return_value=False), \
+             mock.patch.object(authd, "_token_matches", return_value=False), \
              mock.patch.object(authd, "_pam_call_async") as pam_call:
             reply, via = await authd._authenticate("alice", token)
 

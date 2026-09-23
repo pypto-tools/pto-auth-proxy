@@ -111,6 +111,8 @@ install_atomic "$PROJECT_DIR/authd.py" \
     "$PREFIX/auth-proxy/authd.py" 0755
 install_atomic "$PROJECT_DIR/join-proxy.sh" \
     "$PREFIX/auth-proxy/join-proxy.sh" 0755
+install_atomic "$PROJECT_DIR/leave-proxy.sh" \
+    "$PREFIX/auth-proxy/leave-proxy.sh" 0755
 install_atomic "$PROJECT_DIR/configure-shell.sh" \
     "$PREFIX/auth-proxy/configure-shell.sh" 0755
 install_atomic "$PROJECT_DIR/status_proxy.py" \

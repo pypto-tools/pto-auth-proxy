@@ -150,6 +150,11 @@ def guard_ports(upstream_port: int) -> tuple[int, ...]:
     return ports
 
 
+def access_disabled() -> bool:
+    return (Path.home() / ".config" / "pto-auth-proxy" /
+            "access.disabled").exists()
+
+
 def main() -> int:
     user = pwd.getpwuid(os.getuid()).pw_name
     group_name = os.environ.get("PTO_AUTH_PROXY_GROUP", "proxyusers")
@@ -159,18 +164,22 @@ def main() -> int:
     upstream_host = os.environ.get("PTO_AUTH_PROXY_UPSTREAM_HOST", "127.0.0.1")
     upstream_port = int(os.environ.get("PTO_AUTH_PROXY_UPSTREAM_PORT", "4780"))
     protected_ports = guard_ports(upstream_port)
+    disabled = access_disabled()
 
     member_ok = group_member(user, group_name)
     authd_ok, authd_mode = authd_capability(user)
     url, config_source = proxy_url(user, host, port)
-    connect_status = authenticated_connect(url) if url else "no-credential"
+    if disabled:
+        connect_status = "disabled"
+    else:
+        connect_status = authenticated_connect(url) if url else "no-credential"
     guard_service_ok = guard_service_active()
     direct_ok = bool(protected_ports) and direct_access_is_correct(
         user, owner, upstream_host, protected_ports)
     guard_ok = guard_service_ok and direct_ok
 
     ready = member_ok and authd_ok and connect_status == "200" and guard_ok
-    state = "READY" if ready else "NOT_READY"
+    state = "READY" if ready else "LEFT" if disabled else "NOT_READY"
     if not guard_service_ok:
         guard_state = "service-down"
     elif not direct_ok:

@@ -22,6 +22,9 @@ changes, user onboarding, and production service operations clearly separated.
 - `join` reuses an enabled system authd instance, or installs and restarts the
   current user's compatibility watchdog when no instance is enabled. Run it
   only when the user explicitly requests onboarding, verification, or repair.
+- `leave` revokes the current user's proxy tokens, persists a deny marker,
+  removes generated shell configuration, and stops only the legacy per-home
+  watchdog. Run it only when the user explicitly requests proxy logout.
 - Editing the whitelist, signaling the proxy, installing a unit, and starting,
   stopping, restarting, enabling, or disabling a service are state-changing
   administrator operations. Require explicit user intent for the exact action.
@@ -55,6 +58,7 @@ scripts directly:
 
 ```bash
 pto-auth-proxy join
+pto-auth-proxy leave
 pto-auth-proxy status
 pto-auth-proxy test
 ```
@@ -77,6 +81,15 @@ asked to re-run `join` after reboot. Re-running `join` must not create a second
 daemon beside a healthy system instance. System instances use protected
 per-user sockets below `/run/pto-auth-proxy/<uid>/`; `/tmp` is only a legacy
 compatibility fallback.
+
+`leave` is the inverse of user onboarding. It removes generated credentials
+and shell blocks and writes `~/.config/pto-auth-proxy/access.disabled`, which
+causes both token and PAM authentication to fail even if a system-managed authd
+remains active or returns after reboot. A later successful `join` removes the
+marker. Existing processes retain their environment and existing TCP streams
+are not forcibly terminated. Group membership remains the administrator's
+authorization boundary; decommissioned accounts should also be removed from
+`proxyusers` and have their system authd instance stopped.
 
 After onboarding, ask the user to open a new terminal. A running VS Code/Codex
 process needs a user-initiated Reload Window because an existing process cannot

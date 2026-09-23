@@ -33,6 +33,7 @@ class StatusTest(unittest.TestCase):
     def test_ready_output_contains_no_credential(self):
         output = io.StringIO()
         with mock.patch.object(status_proxy, "group_member", return_value=True), \
+             mock.patch.object(status_proxy, "access_disabled", return_value=False), \
              mock.patch.object(status_proxy, "authd_capability",
                                return_value=(True, "token")), \
              mock.patch.object(status_proxy, "proxy_url",
@@ -49,6 +50,26 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("READY", output.getvalue())
         self.assertNotIn("top-secret", output.getvalue())
+
+    def test_left_state_skips_authenticated_connection(self):
+        output = io.StringIO()
+        with mock.patch.object(status_proxy, "group_member", return_value=True), \
+             mock.patch.object(status_proxy, "access_disabled", return_value=True), \
+             mock.patch.object(status_proxy, "authd_capability",
+                               return_value=(True, "token")), \
+             mock.patch.object(status_proxy, "proxy_url",
+                               return_value=(None, "missing")), \
+             mock.patch.object(status_proxy, "authenticated_connect") as connect, \
+             mock.patch.object(status_proxy, "direct_access_is_correct",
+                               return_value=True), \
+             mock.patch.object(status_proxy, "guard_service_active",
+                               return_value=True), \
+             contextlib.redirect_stdout(output):
+            result = status_proxy.main()
+        self.assertEqual(result, 1)
+        self.assertIn("LEFT", output.getvalue())
+        self.assertIn("proxy=disabled", output.getvalue())
+        connect.assert_not_called()
 
     def test_proxy_url_rejects_non_http_scheme(self):
         environment = {

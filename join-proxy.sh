@@ -29,6 +29,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SRC_DIR=${PTO_AUTH_PROXY_SOURCE_DIR:-$SCRIPT_DIR}
 BIN_DIR=$HOME/.local/bin
 LOG_FILE=$HOME/.local/authproxy-authd.log
+DISABLED_FILE=$HOME/.config/pto-auth-proxy/access.disabled
 PROXY_OWNER=${PTO_AUTH_PROXY_OWNER:-pypto}
 PROXY_GROUP=${PTO_AUTH_PROXY_GROUP:-proxyusers}
 PAM_SERVICE=${PTO_AUTH_PROXY_PAM_SERVICE:-sshd}
@@ -268,6 +269,7 @@ if ! printf '%s' "$PROXY_CREDENTIAL" | bash "$SRC_DIR/configure-shell.sh" "$ME";
   exit 1
 fi
 unset PROXY_CREDENTIAL
+rm -f -- "$DISABLED_FILE"
 
 if [[ "$AUTH_MODE" == token ]]; then
   pass "future shells use the proxy token; Linux password is not stored"

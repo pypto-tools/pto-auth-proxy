@@ -236,6 +236,23 @@ socket 的重复 daemon。`join` 只要求输入一次密码：PAM 验证成功�
 端握手、上游连接、上游握手、半关闭收尾和关闭阶段均设有本机超时；上游异常时会快速失败并回收
 双向转发任务，不会长期积累挂起连接。
 
+不再使用代理时，当前用户可执行：
+
+```bash
+pto-auth-proxy leave
+```
+
+`leave` 会立即写入持久禁用标记、撤销当前及宽限期内的旧 token、删除生成的
+凭据和环境文件、移除 `.bashrc`/`.zshrc` 中由本工具管理的加载块，并停止旧版
+per-home watchdog。systemd 管理的 authd 可以继续运行，但会拒绝该用户后续的
+token 和 Linux 密码认证；再次执行 `join` 并通过 PAM 验证后会清除禁用标记。
+已经建立的 TCP 连接不会被强制中断，当前 shell 和已经运行的应用也不会被子进程
+修改；打开新终端或自行 Reload Window 后不再继承代理变量。
+
+`leave` 是用户侧注销，不会修改系统组。管理员要彻底回收不用账户的授权，还应将该
+用户移出 `proxyusers`，并停止相应的 `pto-auth-proxy-authd@<user>.service`；主代理
+会在新的连接上重新读取组成员关系并拒绝已移除用户。
+
 ## 主仓控制更新
 
 更新检查与更新部署是两个不同状态：生产服务器上的 timer 持续轮询主仓，主仓
@@ -302,6 +319,7 @@ auth_proxy.py                      # SOCKS5 / HTTP CONNECT 主进程
 authd.py                           # 每用户 PAM 认证进程
 status_proxy.py                    # 一行式用户就绪检查
 join-proxy.sh                      # 交互式用户接入
+leave-proxy.sh                     # 用户注销、token 撤销与 shell 清理
 configure-shell.sh                 # 幂等生成用户代理环境
 update/rollout.json                # 主仓发布控制清单
 scripts/auto-update-adapter.sh     # auth-proxy验证/安装适配器

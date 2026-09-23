@@ -73,6 +73,7 @@ _TOKEN_ALPHABET = frozenset(
 )
 _TOKEN_DIR = os.path.join(_MY_HOME, ".config", "pto-auth-proxy")
 _TOKEN_HASH_FILE = os.path.join(_TOKEN_DIR, "token.sha256")
+_DISABLED_FILE = os.path.join(_TOKEN_DIR, "access.disabled")
 _TOKEN_ROTATION_GRACE = 600
 
 _SYSTEM_RUNTIME_DIR = f"/run/pto-auth-proxy/{_UID}"
@@ -142,6 +143,47 @@ def _cache_put(user: str, pw: str) -> None:
 
 def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _access_disabled() -> bool:
+    """Return whether the user explicitly left the proxy."""
+    return os.path.exists(_DISABLED_FILE)
+
+
+def _enable_proxy_access() -> None:
+    """Clear a previous leave marker after successful local onboarding."""
+    try:
+        os.unlink(_DISABLED_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def _disable_proxy_access() -> None:
+    """Persistently deny auth and revoke all issued proxy tokens."""
+    os.makedirs(_TOKEN_DIR, mode=0o700, exist_ok=True)
+    os.chmod(_TOKEN_DIR, 0o700)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".access-disabled.", dir=_TOKEN_DIR, text=True)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as marker:
+            marker.write("disabled by pto-auth-proxy leave\n")
+        os.replace(temp_path, _DISABLED_FILE)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+    try:
+        os.unlink(_TOKEN_HASH_FILE)
+    except FileNotFoundError:
+        pass
+    _cache.clear()
 
 
 def _looks_like_proxy_token(credential: str) -> bool:
@@ -247,6 +289,12 @@ async def _pam_call_async(user: str, password: str):
 
 async def _authenticate(user: str, credential: str):
     """Authenticate a token when it matches, otherwise preserve PAM fallback."""
+    if _access_disabled():
+        return {
+            "ok": False,
+            "code": -8,
+            "reason": "proxy access disabled by user",
+        }, "disabled"
     if _looks_like_proxy_token(credential):
         ok = _token_matches(credential)
         return {
@@ -303,7 +351,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
 
         if op == "capabilities":
             reply = {"ok": True, "code": 0,
-                     "capabilities": ["token-v1"]}
+                     "capabilities": ["token-v1", "leave-v1"]}
         elif user != _MY_NAME:
             reply = {"ok": False, "code": -1,
                      "reason": f"authd for {_MY_NAME!r} refuses to verify {user!r}"}
@@ -318,6 +366,14 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
                 if ok:
                     _cache_put(user, credential)
                     reply["token"] = _issue_proxy_token()
+                    _enable_proxy_access()
+        elif op == "revoke-token":
+            if peer_uid != _UID:
+                reply = {"ok": False, "code": -5,
+                         "reason": "only the user may revoke their proxy token"}
+            else:
+                _disable_proxy_access()
+                reply = {"ok": True, "code": 0, "reason": "disabled"}
         elif op != "authenticate":
             reply = {"ok": False, "code": -7,
                      "reason": f"unsupported operation: {op}"}
